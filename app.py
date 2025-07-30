@@ -27,9 +27,7 @@ st.sidebar.write(
 "
     "2. Using Google Gemini to generate relevant user queries (fan‑outs).
 "
-    "3. Comparing queries against your headings to find missing topics.
-"
-    
+    "3. Comparing queries against your headings to identify missing topics."
 )
 
 # Load API keys from Streamlit secrets
