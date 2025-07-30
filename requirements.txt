@@ -1,0 +1,8 @@
+# requirements.txt
+streamlit
+pandas
+requests
+beautifulsoup4
+openai
+cloudscraper
+playwright
