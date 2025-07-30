@@ -18,6 +18,20 @@ import openai
 st.set_page_config(page_title="Content Gap Audit", layout="wide")
 st.title("🔍 Content Gap Audit Tool")
 
+# Sidebar explanation
+st.sidebar.header("About Content Gap Audit")
+st.sidebar.write(
+    "This tool compares your content against AI Overview query fan-outs by:
+"
+    "1. Extracting your page's H1 and subheadings (H2–H4).
+"
+    "2. Using Google Gemini to generate relevant user queries (fan‑outs).
+"
+    "3. Comparing queries against your headings to find missing topics.
+"
+    
+)
+
 # Load API keys from Streamlit secrets
 openai.api_key = st.secrets["openai"]["api_key"]
 gemini_api_key = st.secrets["google"]["gemini_api_key"]
@@ -46,7 +60,7 @@ if urls_input:
     def extract_h1_and_headings(url):
         """
         Attempt to fetch H1 and H2-H4 headings using Playwright; if that fails,
-        fallback to cloudscraper. On any exception or HTTP error, return empty values.
+        fallback to cloudscraper. On any exception or HTTP error, return empty values silently.
         """
         # Try Playwright first
         try:
@@ -77,7 +91,7 @@ if urls_input:
         ]
         return h1, headings
 
-    # Helper: fetch query fan‑outs via Google Gemini
+    # Helper: fetch query fan‑outs via Google Gemini‑outs via Google Gemini
     def fetch_query_fan_outs(h1_text):
         endpoint = (
             f"https://generativelanguage.googleapis.com/v1beta/models/"
@@ -194,6 +208,7 @@ if urls_input:
         st.dataframe(df_sum)
     else:
         st.info("No summary results to display.")
+
 
 
 
