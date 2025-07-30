@@ -43,29 +43,35 @@ if urls_input:
 
     # Helper definitions
     def extract_h1_and_headings(url):
+    """
+    Attempt to fetch H1 and H2-H4 headings using Playwright; if that fails,
+    fallback to cloudscraper. On any exception or HTTP error, return empty.
+    """
+    # Try Playwright first
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.goto(url, timeout=60000)
+            html = page.content()
+            browser.close()
+        soup = BeautifulSoup(html, "html.parser")
+    except Exception:
+        # Fallback to cloudscraper GET
         try:
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True)
-                page = browser.new_page()
-                page.goto(url, timeout=60000)
-                html = page.content()
-                browser.close()
-            soup = BeautifulSoup(html, "html.parser")
-        except Exception as e:
-            st.warning(f"Playwright failed for {url}: {e}")
             scraper = cloudscraper.create_scraper(
                 browser={"browser": "chrome", "platform": "windows", "mobile": False}
             )
-            try:
-                resp = scraper.get(url, timeout=30)
-                resp.raise_for_status()
-                soup = BeautifulSoup(resp.text, "html.parser")
-            except Exception as e2:
-                st.warning(f"Scraper fallback failed for {url}: {e2}")
-                return "", []
-        h1 = soup.find("h1").get_text(strip=True) if soup.find("h1") else ""
-        headings = [(tag.name.upper(), tag.get_text(strip=True)) for tag in soup.find_all(['h2','h3','h4'])]
-        return h1, headings
+            resp = scraper.get(url, timeout=30)
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, "html.parser")
+        except Exception:
+            # Give up and return empty
+            return "", []
+    # Extract H1 and H2-H4
+    h1 = soup.find("h1").get_text(strip=True) if soup.find("h1") else ""
+    headings = [(tag.name.upper(), tag.get_text(strip=True)) for tag in soup.find_all(['h2','h3','h4'])]
+    return h1, headings
 
     def fetch_query_fan_outs(h1_text):
         endpoint = (
@@ -164,6 +170,7 @@ if urls_input:
     df_sum = pd.DataFrame(summary)
     st.download_button("Download Summary CSV", df_sum.to_csv(index=False).encode('utf-8'), 'summary.csv', 'text/csv')
     st.dataframe(df_sum)
+
 
 
 
