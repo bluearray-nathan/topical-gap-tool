@@ -1,6 +1,6 @@
 import subprocess
 import sys
-# Automatically install Playwright browsers if missing
+# Install Playwright browser binaries if possible (non-fatal)
 subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=False)
 
 import streamlit as st
@@ -10,6 +10,7 @@ import re
 import json
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
+import cloudscraper
 import openai
 
 # --- Streamlit UI ---
@@ -17,20 +18,33 @@ st.set_page_config(page_title="Content Gap Audit", layout="wide")
 st.title("🔍 Content Gap Audit Tool")
 
 # Load API keys from Streamlit secrets
-openai.api_key = st.secrets["openai"]["api_key"]
-gemini_api_key = st.secrets["google"]["gemini_api_key"]
+openai.api_key      = st.secrets["openai"]["api_key"]
+gemini_api_key      = st.secrets["google"]["gemini_api_key"]
 
-# Helper: extract H1 + headings via Playwright
+# Helper: extract H1 + headings via Playwright with fallback to cloudscraper
 def extract_h1_and_headings(url):
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-        page.goto(url, timeout=60000)
-        html = page.content()
-        browser.close()
-    soup = BeautifulSoup(html, "html.parser")
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.goto(url, timeout=60000)
+            html = page.content()
+            browser.close()
+        soup = BeautifulSoup(html, "html.parser")
+    except Exception:
+        # Fallback: use cloudscraper
+        scraper = cloudscraper.create_scraper(
+            browser={"browser": "chrome", "platform": "windows", "mobile": False}
+        )
+        resp = scraper.get(url, timeout=30)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+
     h1 = soup.find("h1").get_text(strip=True) if soup.find("h1") else ""
-    headings = [(tag.name.upper(), tag.get_text(strip=True)) for tag in soup.find_all(['h2','h3','h4'])]
+    headings = [
+        (tag.name.upper(), tag.get_text(strip=True))
+        for tag in soup.find_all(['h2', 'h3', 'h4'])
+    ]
     return h1, headings
 
 # Helper: fetch query fan‑outs via Google Gemini
@@ -41,7 +55,7 @@ def fetch_query_fan_outs(h1_text):
     )
     payload = {
         "contents": [{"parts": [{"text": h1_text}]}],
-        "tools": [{"google_search": {}}],
+        "tools":    [{"google_search": {}}],
         "generationConfig": {"temperature": 1.0}
     }
     try:
@@ -129,4 +143,5 @@ if df_file:
             "text/csv"
         )
         st.dataframe(df_out)
+
 
