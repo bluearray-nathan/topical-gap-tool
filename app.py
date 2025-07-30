@@ -21,18 +21,15 @@ st.title("🔍 Content Gap Audit Tool")
 # Sidebar explanation
 st.sidebar.header("About Content Gap Audit")
 st.sidebar.write(
-    "This tool compares your content against AI Overview query fan-outs by:
-"
-    "1. Extracting your page's H1 and subheadings (H2–H4).
-"
-    "2. Using Google Gemini to generate relevant user queries (fan‑outs).
-"
-    "3. Comparing queries against your headings to identify missing topics."
+    """This tool automates an SEO content coverage audit by:
+1. Extracting your page's H1 and subheadings (H2–H4).
+2. Using Google Gemini to generate relevant user queries (fan‑outs).
+3. Comparing queries against your headings with OpenAI GPT to identify missing topics."""
 )
 
 # Load API keys from Streamlit secrets
-openai.api_key = st.secrets["openai"]["api_key"]
-gemini_api_key = st.secrets["google"]["gemini_api_key"]
+openai.api_key    = st.secrets["openai"]["api_key"]
+gemini_api_key    = st.secrets["google"]["gemini_api_key"]
 
 # Input URLs directly
 urls_input = st.text_area(
@@ -47,20 +44,15 @@ if urls_input:
 
     # Initialize progress and timer
     progress_bar = st.progress(0)
-    status_text = st.empty()
-    start_time = time.time()
+    status_text  = st.empty()
+    start_time   = time.time()
 
-    # Outputs
+    # Prepare outputs
     detailed = []
-    summary = []
+    summary  = []
 
     # Helper: extract H1 + headings via Playwright with fallback to cloudscraper
     def extract_h1_and_headings(url):
-        """
-        Attempt to fetch H1 and H2-H4 headings using Playwright; if that fails,
-        fallback to cloudscraper. On any exception or HTTP error, return empty values silently.
-        """
-        # Try Playwright first
         try:
             with sync_playwright() as p:
                 browser = p.chromium.launch(headless=True)
@@ -70,41 +62,35 @@ if urls_input:
                 browser.close()
             soup = BeautifulSoup(html, "html.parser")
         except Exception:
-            # Fallback to cloudscraper GET
             try:
                 scraper = cloudscraper.create_scraper(
-                    browser={"browser": "chrome", "platform": "windows", "mobile": False}
+                    browser={"browser":"chrome","platform":"windows","mobile":False}
                 )
                 resp = scraper.get(url, timeout=30)
                 resp.raise_for_status()
                 soup = BeautifulSoup(resp.text, "html.parser")
             except Exception:
-                # Give up and return empty
                 return "", []
-        # Extract H1 and H2-H4
         h1 = soup.find("h1").get_text(strip=True) if soup.find("h1") else ""
-        headings = [
-            (tag.name.upper(), tag.get_text(strip=True))
-            for tag in soup.find_all(['h2','h3','h4'])
-        ]
+        headings = [(tag.name.upper(), tag.get_text(strip=True)) for tag in soup.find_all(["h2","h3","h4"])]
         return h1, headings
 
-    # Helper: fetch query fan‑outs via Google Gemini‑outs via Google Gemini
+    # Helper: fetch query fan‑outs via Google Gemini
     def fetch_query_fan_outs(h1_text):
         endpoint = (
             f"https://generativelanguage.googleapis.com/v1beta/models/"
             f"gemini-2.5-flash:generateContent?key={gemini_api_key}"
         )
         payload = {
-            "contents": [{"parts": [{"text": h1_text}]}],
-            "tools":    [{"google_search": {}}],
-            "generationConfig": {"temperature": 1.0}
+            "contents":[{"parts":[{"text":h1_text}]}],
+            "tools":[{"google_search":{}}],
+            "generationConfig":{"temperature":1.0}
         }
         try:
             r = requests.post(endpoint, json=payload, timeout=30)
             r.raise_for_status()
             cand = r.json().get("candidates", [{}])[0]
-            return cand.get("groundingMetadata", {}).get("webSearchQueries", [])
+            return cand.get("groundingMetadata",{}).get("webSearchQueries",[])
         except Exception as e:
             st.warning(f"Fan‑out fetch failed: {e}")
             return []
@@ -139,7 +125,6 @@ if urls_input:
             temperature=0.2
         )
         txt = resp.choices[0].message.content.strip()
-        # Strip markdown fences if present
         txt = re.sub(r"^```(?:json)?\s*", "", txt)
         txt = re.sub(r"\s*```$", "", txt)
         try:
@@ -150,62 +135,55 @@ if urls_input:
 
     # Processing loop
     for idx, url in enumerate(urls):
-        # Update progress and ETA
-        elapsed = time.time() - start_time
-        avg = elapsed / (idx + 1)
-        left = total - (idx + 1)
-        eta = int(left * avg)
-        progress = int((idx + 1) / total * 100)
-        progress_bar.progress(progress)
-        status_text.text(f"Processing {idx+1}/{total}. ETA: {eta}s")
+        elapsed   = time.time() - start_time
+        avg       = elapsed / (idx + 1)
+        remaining = total - (idx + 1)
+        eta_secs  = remaining * avg
+        mins      = int(eta_secs // 60)
+        secs      = int(eta_secs % 60)
+        eta_str   = f"{mins}m {secs}s" if mins>0 else f"{secs}s"
+        progress_bar.progress(int((idx+1)/total*100))
+        status_text.text(f"Processing {idx+1}/{total}. ETA: {eta_str}")
 
-        # Extract headings
         h1, headings = extract_h1_and_headings(url)
         if not h1 and not headings:
             continue
-
-        # Fetch and analyze queries
         queries = fetch_query_fan_outs(h1)
         if not queries:
             continue
-        prompt = build_prompt(h1, headings, queries)
+        prompt  = build_prompt(h1,headings,queries)
         results = get_explanations(prompt)
 
-        # Compute coverage
         covered = sum(1 for it in results if it.get("covered"))
-        pct = round((covered / len(results)) * 100) if results else 0
-        summary.append({"Address": url, "Coverage (%)": pct})
+        pct     = round((covered/len(results))*100) if results else 0
+        summary.append({"Address":url,"Coverage (%)":pct})
 
-        # Build detailed row
-        row = {
-            "Address": url,
-            "H1-1": h1,
-            "Content Structure": " | ".join(f"{lvl}:{txt}" for lvl, txt in headings)
-        }
+        row = {"Address":url,"H1-1":h1,"Content Structure":" | ".join(f"{lvl}:{txt}" for lvl,txt in headings)}
         for i, it in enumerate(results):
-            row[f"Query {i+1}"] = it.get("query", "")
-            row[f"Query {i+1} Covered"] = "Yes" if it.get("covered") else "No"
-            row[f"Query {i+1} Explanation"] = it.get("explanation", "")
+            row[f"Query {i+1}"]             = it.get("query","")
+            row[f"Query {i+1} Covered"]     = "Yes" if it.get("covered") else "No"
+            row[f"Query {i+1} Explanation"] = it.get("explanation","")
         detailed.append(row)
 
-    # Finalize progress
+    # Finalize
     progress_bar.progress(100)
     status_text.text("Complete!")
 
-    # Download buttons and display
+    # Download
     if detailed:
         df_det = pd.DataFrame(detailed)
-        st.download_button("Download Detailed CSV", df_det.to_csv(index=False).encode('utf-8'), 'detailed.csv', 'text/csv')
+        st.download_button("Download Detailed CSV", df_det.to_csv(index=False).encode('utf-8'), 'detailed.csv','text/csv')
         st.dataframe(df_det)
     else:
         st.info("No detailed results to display.")
 
     if summary:
         df_sum = pd.DataFrame(summary)
-        st.download_button("Download Summary CSV", df_sum.to_csv(index=False).encode('utf-8'), 'summary.csv', 'text/csv')
+        st.download_button("Download Summary CSV", df_sum.to_csv(index=False).encode('utf-8'), 'summary.csv','text/csv')
         st.dataframe(df_sum)
     else:
         st.info("No summary results to display.")
+
 
 
 
