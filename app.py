@@ -87,7 +87,6 @@ if urls_input:
                         browser={"browser": "chrome", "platform": "windows", "mobile": False}
                     )
                     resp = scraper.get(url, timeout=30)
-                    # If it's an HTTP error, capture status
                     try:
                         resp.raise_for_status()
                     except requests.exceptions.HTTPError as he:
@@ -97,7 +96,6 @@ if urls_input:
                     soup = BeautifulSoup(resp.text, "html.parser")
                 except Exception:
                     return "", [], "Fetch failed (both Playwright and fallback)"
-            # Extract headings
             h1 = soup.find("h1").get_text(strip=True) if soup.find("h1") else ""
             headings = [(tag.name.upper(), tag.get_text(strip=True)) for tag in soup.find_all(["h2", "h3", "h4"])]
             return h1, headings, None
@@ -110,7 +108,8 @@ if urls_input:
             payload = {
                 "contents": [{"parts": [{"text": h1_text}]}],
                 "tools": [{"google_search": {}}],
-                "generationConfig": {"temperature": 1.0},
+                # very low temperature for more deterministic fan-outs
+                "generationConfig": {"temperature": 0.0},
             }
             try:
                 r = requests.post(endpoint, json=payload, timeout=30)
@@ -144,8 +143,8 @@ if urls_input:
 
         def get_explanations(prompt):
             resp = openai.chat.completions.create(
-                model="gpt-4o", messages=[{"role": "user", "content": prompt}], temperature=0.2
-            )
+                model="gpt-4o", messages=[{"role": "user", "content": prompt}], temperature=0.1
+            )  # low temperature for concise, stable gaps
             txt = resp.choices[0].message.content.strip()
             txt = re.sub(r"^```(?:json)?\s*", "", txt)
             txt = re.sub(r"\s*```$", "", txt)
@@ -168,7 +167,6 @@ if urls_input:
             status_text.text(f"Processing {idx+1}/{total}. ETA: {eta_str}")
 
             h1, headings, err = extract_h1_and_headings(url)
-            # Handle fetch errors including 403
             if err:
                 if "403" in err:
                     st.error(
@@ -254,7 +252,6 @@ if urls_input:
         if skipped:
             st.subheader("Skipped URLs and Reasons")
             st.table(pd.DataFrame(skipped))
-
 
 
 
