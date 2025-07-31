@@ -18,7 +18,7 @@ import openai
 st.set_page_config(page_title="Content Gap Audit", layout="wide")
 st.title("🔍 Content Gap Audit Tool")
 
-# Sidebar explanation
+# Sidebar explanation (no benefits section)
 st.sidebar.header("About Content Gap Audit")
 st.sidebar.write(
     """This tool automates an SEO content coverage audit by:
@@ -27,7 +27,7 @@ st.sidebar.write(
 3. Comparing queries against your headings with OpenAI GPT to identify missing topics."""
 )
 
-# Load API keys
+# Load API keys from Streamlit secrets
 openai.api_key = st.secrets["openai"]["api_key"]
 gemini_api_key = st.secrets["google"]["gemini_api_key"]
 
@@ -50,50 +50,62 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# Utilities for state initialization
+def reset_state(urls):
+    st.session_state.last_urls = urls
+    st.session_state.run = False
+    st.session_state.results_ready = False
+    st.session_state.detailed = []
+    st.session_state.summary = []
+    st.session_state.actions = []
+    st.session_state.skipped = []
+    st.session_state.progress = 0
+
+# If input changed, reset
 if urls_input:
     urls = [u.strip() for u in urls_input.splitlines() if u.strip()]
     total = len(urls)
     st.write(f"Found {total} URLs to process.")
 
-    if st.button("Start Audit"):
-        # Initialize
+    if "last_urls" not in st.session_state or st.session_state.last_urls != urls:
+        reset_state(urls)
+
+    # Trigger processing
+    if st.button("Start Audit", key="start"):
+        st.session_state.run = True
+        st.session_state.results_ready = False  # force processing fresh
+
+    # Only run once per input unless re-triggered
+    if st.session_state.run and not st.session_state.results_ready:
         progress_bar = st.progress(0)
         status_text = st.empty()
         start_time = time.time()
 
-        # Prepare outputs
-        detailed = []
-        summary = []
-        actions = []
-        skipped = []
-
         # Helpers
         def extract_h1_and_headings(url):
-            # Try Playwright first with status detection
             try:
                 with sync_playwright() as p:
                     browser = p.chromium.launch(headless=True)
                     page = browser.new_page()
-                    response = page.goto(url, timeout=60000)
-                    if response and response.status == 403:
+                    resp = page.goto(url, timeout=60000)
+                    if resp and resp.status == 403:
                         return "", [], "HTTP 403 Forbidden (Playwright)"
                     html = page.content()
                     browser.close()
                 soup = BeautifulSoup(html, "html.parser")
             except Exception:
-                # Fallback to cloudscraper
                 try:
                     scraper = cloudscraper.create_scraper(
                         browser={"browser": "chrome", "platform": "windows", "mobile": False}
                     )
-                    resp = scraper.get(url, timeout=30)
+                    r = scraper.get(url, timeout=30)
                     try:
-                        resp.raise_for_status()
+                        r.raise_for_status()
                     except requests.exceptions.HTTPError as he:
                         code = he.response.status_code if he.response else "unknown"
                         reason = he.response.reason if he.response and hasattr(he.response, "reason") else ""
-                        return "", [], f"HTTP {code} {reason} (Fallback)"
-                    soup = BeautifulSoup(resp.text, "html.parser")
+                        return "", [], f"HTTP {code} {reason} (fallback)"
+                    soup = BeautifulSoup(r.text, "html.parser")
                 except Exception:
                     return "", [], "Fetch failed (both Playwright and fallback)"
             h1 = soup.find("h1").get_text(strip=True) if soup.find("h1") else ""
@@ -108,7 +120,7 @@ if urls_input:
             payload = {
                 "contents": [{"parts": [{"text": h1_text}]}],
                 "tools": [{"google_search": {}}],
-                # very low temperature for more deterministic fan-outs
+                # very low temperature for stable fan-outs
                 "generationConfig": {"temperature": 0.0},
             }
             try:
@@ -154,7 +166,7 @@ if urls_input:
             except:
                 return []
 
-        # Processing
+        # Loop and process
         for idx, url in enumerate(urls):
             elapsed = time.time() - start_time
             avg = elapsed / (idx + 1)
@@ -173,33 +185,40 @@ if urls_input:
                         f"❌ Could not access {url}: {err}. "
                         "Possible reasons: site is behind Cloudflare/WAF, IP blocked, rate-limited, or requires JS/auth."
                     )
-                    skipped.append({"Address": url, "Reason": f"{err} (likely blocked/forbidden)"})
+                    st.session_state.skipped.append(
+                        {"Address": url, "Reason": f"{err} (likely blocked/forbidden)"}
+                    )
                 else:
                     st.warning(f"⚠️ Skipped {url}: {err}.")
-                    skipped.append({"Address": url, "Reason": err})
+                    st.session_state.skipped.append({"Address": url, "Reason": err})
                 continue
 
             if not h1 and not headings:
-                skipped.append({"Address": url, "Reason": "No H1 or subheadings found on page"})
+                st.warning(f"Skipped {url}: no H1 or subheadings found.")
+                st.session_state.skipped.append({"Address": url, "Reason": "No H1 or subheadings found"})
                 continue
 
             queries = fetch_query_fan_outs(h1)
             if not queries:
-                skipped.append({"Address": url, "Reason": f"No fan-out queries returned for H1: '{h1}'"})
+                st.warning(f"Skipped {url}: no fan-out queries for H1 '{h1}'.")
+                st.session_state.skipped.append(
+                    {"Address": url, "Reason": f"No fan-out queries returned for H1: '{h1}'"}
+                )
                 continue
 
             prompt = build_prompt(h1, headings, queries)
             results = get_explanations(prompt)
             if not results:
-                skipped.append({"Address": url, "Reason": "OpenAI returned no results or parsing failed"})
+                st.warning(f"Skipped {url}: OpenAI returned no usable output.")
+                st.session_state.skipped.append({"Address": url, "Reason": "OpenAI returned no results or parsing failed"})
                 continue
 
             covered = sum(1 for it in results if it.get("covered"))
             pct = round((covered / len(results)) * 100) if results else 0
-            summary.append({"Address": url, "Coverage (%)": pct})
+            st.session_state.summary.append({"Address": url, "Coverage (%)": pct})
 
             missing = [it.get("query") for it in results if not it.get("covered")]
-            actions.append(
+            st.session_state.actions.append(
                 {
                     "Address": url,
                     "Recommended Sections to Add to Content": "; ".join(missing),
@@ -215,15 +234,18 @@ if urls_input:
                 row[f"Query {i+1}"] = it.get("query", "")
                 row[f"Query {i+1} Covered"] = "Yes" if it.get("covered") else "No"
                 row[f"Query {i+1} Explanation"] = it.get("explanation", "")
-            detailed.append(row)
+            st.session_state.detailed.append(row)
 
         # Finalize
         progress_bar.progress(100)
         status_text.text("Complete!")
+        st.session_state.results_ready = True
 
-        # Outputs
-        if detailed:
-            df_det = pd.DataFrame(detailed)
+    # Display / download if results are ready
+    if st.session_state.get("results_ready", False):
+        # Detailed
+        if st.session_state.detailed:
+            df_det = pd.DataFrame(st.session_state.detailed)
             st.download_button(
                 "Download Detailed CSV", df_det.to_csv(index=False).encode("utf-8"), "detailed.csv", "text/csv"
             )
@@ -231,8 +253,9 @@ if urls_input:
         else:
             st.info("No detailed results to display.")
 
-        if summary:
-            df_sum = pd.DataFrame(summary)
+        # Summary
+        if st.session_state.summary:
+            df_sum = pd.DataFrame(st.session_state.summary)
             st.download_button(
                 "Download Summary CSV", df_sum.to_csv(index=False).encode("utf-8"), "summary.csv", "text/csv"
             )
@@ -240,8 +263,9 @@ if urls_input:
         else:
             st.info("No summary results to display.")
 
-        if actions:
-            df_act = pd.DataFrame(actions)
+        # Actions
+        if st.session_state.actions:
+            df_act = pd.DataFrame(st.session_state.actions)
             st.download_button(
                 "Download Actions CSV", df_act.to_csv(index=False).encode("utf-8"), "actions.csv", "text/csv"
             )
@@ -249,9 +273,10 @@ if urls_input:
         else:
             st.info("No actions to display.")
 
-        if skipped:
+        # Skipped
+        if st.session_state.skipped:
             st.subheader("Skipped URLs and Reasons")
-            st.table(pd.DataFrame(skipped))
+            st.table(pd.DataFrame(st.session_state.skipped))
 
 
 
