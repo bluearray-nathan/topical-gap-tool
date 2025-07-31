@@ -26,19 +26,10 @@ st.sidebar.write(
 3. Comparing those queries against the content via OpenAI GPT to identify concise missing topics."""
 )
 
-# Parameters / controls
-gemini_temp = st.sidebar.slider(
-    "Gemini fan-out temperature (diversity)", 0.0, 1.0, 0.3, step=0.05,
-    help="Higher = more varied query fan-outs; may include looser/related terms."
-)
-gpt_temp = st.sidebar.slider(
-    "GPT temperature (gap reasoning)", 0.0, 0.5, 0.1, step=0.05,
-    help="Low keeps explanations tight and deterministic."
-)
-attempts = st.sidebar.number_input(
-    "Gemini aggregation attempts", min_value=1, max_value=8, value=5, step=1,
-    help="How many times to call Gemini and aggregate before deduplication."
-)
+# Fixed settings (no user adjustment)
+gemini_temp = 0.3  # fan-out diversity
+gpt_temp = 0.1     # gap reasoning temperature
+attempts = 3       # number of Gemini aggregation calls
 
 # Load credentials from secrets
 openai.api_key = st.secrets["openai"]["api_key"]
@@ -60,7 +51,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Session state defaults
+# Session state initialization
 for key, default in {
     "last_urls": [],
     "processed": False,
@@ -73,13 +64,13 @@ for key, default in {
     if key not in st.session_state:
         st.session_state[key] = default
 
-# Prepare URL list
+# Prepare URLs list
 urls = [u.strip() for u in urls_input.splitlines() if u.strip()] if urls_input else []
 total = len(urls)
 if urls:
     st.write(f"Found {total} URLs to process.")
 
-# Reset state if input changed
+# Reset when URLs change
 if urls and st.session_state.last_urls != urls:
     st.session_state.last_urls = urls
     st.session_state.processed = False
@@ -89,29 +80,35 @@ if urls and st.session_state.last_urls != urls:
     st.session_state.skipped = []
     st.session_state.h1_fanout_cache = {}
 
-# Start trigger
+# Start button
 start_clicked = st.button("Start Audit")
-if start_clicked and urls:
+if start_clicked:
     st.session_state.processed = False
 
-# Embedding / dedupe helpers
+# Helpers for query normalization & dedupe
 STOPWORDS = {
     "the", "and", "of", "in", "to", "a", "for", "with", "on", "about",
     "vs", "vs.", "is", "are", "your", "what", "how", "why", "more",
     "latest", "new"
 }
 
+def canonicalize_query(q: str) -> str:
+    q_lower = q.lower()
+    q_lower = re.sub(r"\b(what|how|does|do|is|are|the|a|an|of|for|to|about|your)\b", " ", q_lower)
+    q_lower = re.sub(r"\b(includes|including|inclusions)\b", " include ", q_lower)
+    q_lower = re.sub(r"\b(works|working)\b", " work ", q_lower)
+    q_lower = re.sub(r"[^\w\s]", "", q_lower)
+    q_lower = re.sub(r"\s+", " ", q_lower).strip()
+    return q_lower
 
 def content_words(s: str):
     tokens = re.findall(r"[A-Za-z0-9]+", s.lower())
     return [t for t in tokens if t not in STOPWORDS]
 
-
 def cosine(a: np.ndarray, b: np.ndarray):
     if np.linalg.norm(a) == 0 or np.linalg.norm(b) == 0:
         return 0.0
     return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
-
 
 def remove_component(vec: np.ndarray, anchor: np.ndarray):
     denom = np.dot(anchor, anchor)
@@ -119,7 +116,6 @@ def remove_component(vec: np.ndarray, anchor: np.ndarray):
         return vec
     proj = (np.dot(vec, anchor) / denom) * anchor
     return vec - proj
-
 
 def dedupe_queries(queries, raw_threshold=0.9, residual_threshold=0.5, embedding_model="text-embedding-ada-002"):
     if not queries:
@@ -166,10 +162,9 @@ def dedupe_queries(queries, raw_threshold=0.9, residual_threshold=0.5, embedding
                 removed.add(j)
     return kept
 
-
 def fetch_query_fan_outs_multi(h1_text, attempts=3, temp=0.0):
     aggregated = []
-    for attempt in range(attempts):
+    for attempt_i in range(attempts):
         endpoint = (
             f"https://generativelanguage.googleapis.com/v1beta/models/"
             f"gemini-2.5-flash:generateContent?key={gemini_api_key}"
@@ -186,16 +181,26 @@ def fetch_query_fan_outs_multi(h1_text, attempts=3, temp=0.0):
             fanouts = cand.get("groundingMetadata", {}).get("webSearchQueries", [])
             aggregated.extend(fanouts)
         except Exception as e:
-            st.warning(f"Fan-out fetch attempt {attempt+1} failed: {e}")
+            st.warning(f"Fan-out fetch attempt {attempt_i+1} failed: {e}")
         time.sleep(0.2)
+    # exact dedupe preserving order
     seen = set()
     unique_raw = []
     for q in aggregated:
         if q not in seen:
             seen.add(q)
             unique_raw.append(q)
-    return dedupe_queries(unique_raw)
-
+    # canonical dedupe
+    seen_canon = set()
+    filtered = []
+    for q in unique_raw:
+        canon = canonicalize_query(q)
+        if canon in seen_canon:
+            continue
+        seen_canon.add(canon)
+        filtered.append(q)
+    # semantic dedupe after canonical collapse
+    return dedupe_queries(filtered)
 
 def get_explanations(prompt, temperature=0.1, max_retries=2):
     system_msg = (
@@ -252,9 +257,8 @@ def get_explanations(prompt, temperature=0.1, max_retries=2):
     st.warning(f"OpenAI parse failure after {max_retries} attempts. Raw output:\n{last_raw}")
     return []
 
-
-# Main audit loop
-if urls and not st.session_state.processed:
+# Main audit loop (only runs when user clicks)
+if start_clicked and urls and not st.session_state.processed:
     progress_bar = st.progress(0)
     status_text = st.empty()
     start_time = time.time()
@@ -307,8 +311,8 @@ if urls and not st.session_state.processed:
         for q in queries:
             lines.append(f"- {q}")
         lines.extend([
-            "", "3) Return JSON array of objects with keys: query, covered, explanation.", 
-            'Example: [{"query":"...","covered":true,"explanation":"..."}]'
+            "", "3) Return JSON array of objects with keys: query, covered, explanation.",
+            'Example: [{"query":"...","covered":true,"explanation":"..."}]',
         ])
         return "\n".join(lines)
 
@@ -340,20 +344,17 @@ if urls and not st.session_state.processed:
             st.warning(f"Skipped {url}: no H1 or subheadings found.")
             st.session_state.skipped.append({"Address": url, "Reason": "No H1 or subheadings found"})
             continue
-
         if h1 in st.session_state.h1_fanout_cache:
             fanouts = st.session_state.h1_fanout_cache[h1]
         else:
-            fanouts = fetch_query_fan_outs_multi(h1, attempts=int(attempts), temp=gemini_temp)
+            fanouts = fetch_query_fan_outs_multi(h1, attempts=attempts, temp=gemini_temp)
             st.session_state.h1_fanout_cache[h1] = fanouts
-
         if not fanouts:
             st.warning(f"Skipped {url}: no fan-out queries for H1 '{h1}'.")
             st.session_state.skipped.append(
                 {"Address": url, "Reason": f"No fan-out queries returned for H1: '{h1}'"}
             )
             continue
-
         prompt = build_prompt(h1, headings, fanouts)
         results = get_explanations(prompt, temperature=gpt_temp)
         if not results:
@@ -362,18 +363,15 @@ if urls and not st.session_state.processed:
                 {"Address": url, "Reason": "OpenAI returned no results or parsing failed"}
             )
             continue
-
         covered = sum(1 for it in results if it.get("covered"))
         pct = round((covered / len(results)) * 100) if results else 0
         st.session_state.summary.append(
             {"Address": url, "Fan-out Count": len(fanouts), "Coverage (%)": pct}
         )
-
         missing = [it.get("query") for it in results if not it.get("covered")]
         st.session_state.actions.append(
             {"Address": url, "Recommended Sections to Add to Content": "; ".join(missing)}
         )
-
         row = {
             "Address": url,
             "H1-1": h1,
@@ -384,7 +382,6 @@ if urls and not st.session_state.processed:
             row[f"Query {i+1} Covered"] = "Yes" if it.get("covered") else "No"
             row[f"Query {i+1} Explanation"] = it.get("explanation", "")
         st.session_state.detailed.append(row)
-
     progress_bar.progress(100)
     status_text.text("Complete!")
     st.session_state.processed = True
