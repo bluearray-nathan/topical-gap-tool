@@ -15,15 +15,15 @@ import cloudscraper
 import openai
 
 # --- Streamlit UI ---
-st.set_page_config(page_title="Content Gap Audit", layout="wide")
-st.title("🔍 Content Gap Audit Tool")
+st.set_page_config(page_title="AI Overview/AI Mode query fan-out gap analysis", layout="wide")
+st.title("🔍 AI Overview/AI Mode query fan-out gap analysis")
 
 st.sidebar.header("About Content Gap Audit")
 st.sidebar.write(
-    """This tool automates an SEO content coverage audit by:
+    """This identify where gaps exist in your content:
 1. Extracting your page's H1 and subheadings (H2–H4).
-2. Using Google Gemini to generate diverse user query fan-outs with aggregation & deduplication.
-3. Comparing those queries against the content via OpenAI GPT to identify concise missing topics."""
+2. Using Google Gemini to generate diverse user query fan-outs.
+3. Comparing those queries against content headings to identify concise missing topics."""
 )
 
 # Fixed settings (no user adjustment)
