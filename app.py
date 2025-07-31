@@ -18,7 +18,7 @@ import openai
 st.set_page_config(page_title="AI Overview/AI Mode query fan-out gap analysis", layout="wide")
 st.title("🔍 AI Overview/AI Mode query fan-out gap analysis")
 
-st.sidebar.header("About Content Gap Audit")
+st.sidebar.header("About the query fan-out gap analysis tool")
 st.sidebar.write(
     """This identify where gaps exist in your content:
 1. Extracting your page's H1 and subheadings (H2–H4).
