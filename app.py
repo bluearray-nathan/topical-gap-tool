@@ -84,6 +84,9 @@ if urls_input:
                     resp = scraper.get(url, timeout=30)
                     resp.raise_for_status()
                     soup = BeautifulSoup(resp.text, "html.parser")
+                except requests.exceptions.HTTPError as he:
+                    # Bubble up status code for main loop
+                    return None, he.response.status_code
                 except Exception:
                     return "", []
             h1 = soup.find("h1").get_text(strip=True) if soup.find("h1") else ""
@@ -154,9 +157,22 @@ if urls_input:
             progress_bar.progress(int((idx+1)/total*100))
             status_text.text(f"Processing {idx+1}/{total}. ETA: {eta_str}")
 
-            h1, headings = extract_h1_and_headings(url)
-            if not h1 and not headings:
+            result = extract_h1_and_headings(url)
+            # Handle cloudflare 403 bubble-up
+            if isinstance(result[1], int) and result[1] == 403:
+                st.error(
+                    f"❌ Could not access {url} (HTTP 403 Forbidden). "
+                    "Possible reasons: site is behind Cloudflare/WAF, IP blocked, or incorrect URL."
+                )
                 continue
+            h1, headings = result
+            if not h1 and not headings:
+                st.error(
+                    f"❌ Could not fetch content for {url}. "
+                    "Possible reasons: network error, invalid URL, or site block."
+                )
+                continue
+
             queries = fetch_query_fan_outs(h1)
             if not queries:
                 continue
@@ -169,7 +185,11 @@ if urls_input:
             missing = [it.get("query") for it in results if not it.get("covered")]
             actions.append({"Address": url, "Recommended Sections to Add to Content": "; ".join(missing)})
 
-            row = {"Address": url, "H1-1": h1, "Content Structure": " | ".join(f"{lvl}:{txt}" for lvl, txt in headings)}
+            row = {
+                "Address": url,
+                "H1-1": h1,
+                "Content Structure": " | ".join(f"{lvl}:{txt}" for lvl, txt in headings)
+            }
             for i, it in enumerate(results):
                 row[f"Query {i+1}"]             = it.get("query", "")
                 row[f"Query {i+1} Covered"]     = "Yes" if it.get("covered") else "No"
@@ -216,8 +236,6 @@ if urls_input:
             st.dataframe(df_act)
         else:
             st.info("No actions to display.")
-
-
 
 
 
