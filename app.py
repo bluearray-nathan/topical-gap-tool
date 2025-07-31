@@ -123,25 +123,39 @@ if urls and not st.session_state.processed:
         headings = [(tag.name.upper(), tag.get_text(strip=True)) for tag in soup.find_all(["h2", "h3", "h4"])]
         return h1, headings, None
 
-    # Helper: fetch fan-out queries from Gemini with deterministic temperature
-    def fetch_query_fan_outs(h1_text):
+    # Helper: fetch fan-out queries from Gemini with retries + union/dedupe
+    def fetch_query_fan_outs(h1_text, tries=3, cap=12):
         endpoint = (
             f"https://generativelanguage.googleapis.com/v1beta/models/"
             f"gemini-2.5-flash:generateContent?key={gemini_api_key}"
         )
-        payload = {
-            "contents": [{"parts": [{"text": h1_text}]}],
-            "tools": [{"google_search": {}}],
-            "generationConfig": {"temperature": 0.0},  # low randomness
-        }
-        try:
-            r = requests.post(endpoint, json=payload, timeout=30)
-            r.raise_for_status()
-            cand = r.json().get("candidates", [{}])[0]
-            return cand.get("groundingMetadata", {}).get("webSearchQueries", [])
-        except Exception as e:
-            st.warning(f"Fan-out fetch failed: {e}")
-            return []
+        aggregated = []
+        seen = set()
+        backoff = 1
+        for attempt in range(tries):
+            payload = {
+                "contents": [{"parts": [{"text": h1_text}]}],
+                "tools": [{"google_search": {}}],
+                "generationConfig": {"temperature": 0.0},
+            }
+            try:
+                r = requests.post(endpoint, json=payload, timeout=30)
+                r.raise_for_status()
+                cand = r.json().get("candidates", [{}])[0]
+                fanouts = cand.get("groundingMetadata", {}).get("webSearchQueries", []) or []
+                for q in fanouts:
+                    if q not in seen:
+                        seen.add(q)
+                        aggregated.append(q)
+                # early exit if we've reached cap
+                if len(aggregated) >= cap:
+                    break
+            except Exception as e:
+                st.warning(f"Fan-out attempt {attempt+1} failed: {e}")
+            time.sleep(backoff)
+            backoff *= 2
+        # return deduped union, capped
+        return aggregated[:cap]
 
     # Helper: build GPT prompt
     def build_prompt(h1, headings, queries):
@@ -279,7 +293,6 @@ if st.session_state.processed:
     if st.session_state.summary:
         st.subheader("Summary")
         df_sum = pd.DataFrame(st.session_state.summary)
-        # ensure Address, Fan-out Count, Coverage (%) ordering
         base_cols = ["Address", "Fan-out Count", "Coverage (%)"]
         ordered = [c for c in base_cols if c in df_sum.columns] + [c for c in df_sum.columns if c not in base_cols]
         df_sum = df_sum[ordered]
@@ -305,5 +318,4 @@ if st.session_state.processed:
     if st.session_state.skipped:
         st.subheader("Skipped URLs and Reasons")
         st.table(pd.DataFrame(st.session_state.skipped))
-
 
