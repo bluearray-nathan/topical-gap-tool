@@ -33,7 +33,7 @@ gemini_api_key = st.secrets["google"]["gemini_api_key"]
 
 # Input URLs directly
 urls_input = st.text_area(
-    "Enter one URL per line to analyze headers and content gaps:",
+    "Enter one URL per line to analyse your content for potential gaps:",
     placeholder="https://example.com/page1\nhttps://example.com/page2"
 )
 
