@@ -15,16 +15,16 @@ import cloudscraper
 import openai
 
 # --- Streamlit UI ---
-st.set_page_config(page_title="AI Mode Query Fan-Out Gap Analysis", layout="wide")
-st.title("🔍 AI Mode Query Fan-Out Gap Analysis")
+st.set_page_config(page_title="Content Gap Audit", layout="wide")
+st.title("🔍 Content Gap Audit Tool")
 
 # Sidebar explanation
-st.sidebar.header("About AI Mode Query Fan-Out Gap Analysis")
+st.sidebar.header("About Content Gap Audit")
 st.sidebar.write(
-    """This tool compares your content against AI Mode/AI Overview query fan-outs by:
+    """This tool automates an SEO content coverage audit by:
 1. Extracting your page's H1 and subheadings (H2–H4).
 2. Using Google Gemini to generate relevant user queries (fan‑outs).
-3. Comparing queries against your headings to identify missing topics."""
+3. Comparing queries against your headings with OpenAI GPT to identify missing topics."""
 )
 
 # Load API keys from Streamlit secrets
@@ -50,6 +50,7 @@ if urls_input:
     # Prepare outputs
     detailed = []
     summary  = []
+    actions  = []  # recommended missing queries
 
     # Helper: extract H1 + headings via Playwright with fallback to cloudscraper
     def extract_h1_and_headings(url):
@@ -157,6 +158,9 @@ if urls_input:
         covered = sum(1 for it in results if it.get("covered"))
         pct     = round((covered/len(results))*100) if results else 0
         summary.append({"Address":url,"Coverage (%)":pct})
+        # Record missing queries as actions
+        missing = [it.get("query") for it in results if not it.get("covered")]
+        actions.append({"Address":url, "Recommended Sections to Add to Content": "; ".join(missing)})
 
         row = {"Address":url,"H1-1":h1,"Content Structure":" | ".join(f"{lvl}:{txt}" for lvl,txt in headings)}
         for i, it in enumerate(results):
@@ -183,6 +187,15 @@ if urls_input:
         st.dataframe(df_sum)
     else:
         st.info("No summary results to display.")
+
+    # Actions output
+    if actions:
+        df_act = pd.DataFrame(actions)
+        st.download_button("Download Actions CSV", df_act.to_csv(index=False).encode('utf-8'), 'actions.csv','text/csv')
+        st.dataframe(df_act)
+    else:
+        st.info("No actions to display.")
+
 
 
 
