@@ -97,11 +97,27 @@ def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
         return 0.0
     return float(np.dot(a, b) / (norm_a * norm_b))
 
-# Embedding retrieval
+# Embedding retrieval with proper response handling
 def get_embeddings(texts, model="text-embedding-ada-002"):
     try:
         resp = openai.embeddings.create(model=model, input=texts)
-        return [np.array(item["embedding"], dtype=float) for item in resp["data"]]
+        # Support both attribute-style and dict-style responses
+        data = None
+        if hasattr(resp, "data"):
+            data = resp.data
+        elif isinstance(resp, dict):
+            data = resp.get("data", [])
+        else:
+            data = []
+        embeddings = []
+        for item in data:
+            if hasattr(item, "embedding"):
+                embeddings.append(np.array(item.embedding, dtype=float))
+            elif isinstance(item, dict) and "embedding" in item:
+                embeddings.append(np.array(item["embedding"], dtype=float))
+            else:
+                embeddings.append(None)
+        return embeddings
     except Exception as e:
         st.warning(f"Embedding call failed: {e}")
         return [None] * len(texts)
@@ -215,10 +231,10 @@ if urls and not st.session_state.processed:
                 '  suggested_heading: if missing, a proposed heading title (empty if covered),',
                 '  confidence: one of high, medium, low indicating how clear the gap is.',
                 "Example:",
-                '[', 
+                "[",
                 '{"query":"lifecycle environmental impact comparison EV vs gasoline","covered":false,"explanation":"No section ties all lifecycle stages together.","suggested_heading":"EV vs Gasoline Cars: Full Lifecycle Environmental Impact","confidence":"high"},',
                 '{"query":"battery disposal environmental issues","covered":true,"explanation":"Recycling section partially covers this.","suggested_heading":"","confidence":"medium"}',
-                ']',
+                "]",
             ]
         )
         return "\n".join(lines)
@@ -324,7 +340,6 @@ if urls and not st.session_state.processed:
             similarity = p.get("similarity", 0.0)
             gpt_entry = next((g for g in gpt_results if g.get("query", "") == q), None)
 
-            gap_flagged = False
             explanation = ""
             suggested_heading = ""
             confidence = ""
@@ -333,14 +348,12 @@ if urls and not st.session_state.processed:
             gpt_covered = True  # default assume covered if no entry
 
             if prelabel == "covered":
-                # base: fully covered
                 final_weight = 1.0
                 final_covered = True
                 explanation = "Pre-match semantic similarity indicates strong coverage."
                 confidence = "high"
                 if gpt_entry and not gpt_entry.get("covered", True):
                     gpt_covered = False
-                    gap_flagged = True
                     explanation = gpt_entry.get("explanation", "")
                     suggested_heading = gpt_entry.get("suggested_heading", "")
                     confidence = gpt_entry.get("confidence", "medium")
@@ -352,7 +365,6 @@ if urls and not st.session_state.processed:
                         final_weight = 0.9
                     final_covered = final_weight >= 0.75
             else:
-                # uncertain or missing
                 if gpt_entry:
                     gpt_covered = bool(gpt_entry.get("covered", False))
                     confidence = gpt_entry.get("confidence", "medium")
@@ -362,7 +374,6 @@ if urls and not st.session_state.processed:
                         final_weight = 1.0
                         final_covered = True
                     else:
-                        gap_flagged = True
                         if prelabel == "uncertain":
                             if confidence == "high":
                                 final_weight = 0.0
@@ -379,13 +390,12 @@ if urls and not st.session_state.processed:
                                 final_weight = 0.5
                         final_covered = final_weight >= 0.75
                 else:
-                    # No GPT feedback: fallback heuristics
                     if prelabel == "uncertain":
                         final_weight = 1.0
                         final_covered = True
                         explanation = "No GPT contradiction; treating uncertain as covered."
                         confidence = "medium"
-                    else:  # missing
+                    else:
                         final_weight = 0.0
                         final_covered = False
                         explanation = "No GPT response; treated as missing."
@@ -436,7 +446,7 @@ if urls and not st.session_state.processed:
             }
         )
 
-        # Actions: missing queries with their suggested headings
+        # Actions
         action_suggestions = []
         for r in detailed_rows_for_url:
             if not r["Final Covered"] and r["Suggested Heading"]:
@@ -448,7 +458,7 @@ if urls and not st.session_state.processed:
             }
         )
 
-    # Mark done
+    # Finalize
     progress_bar.progress(100)
     status_text.text("Complete!")
     st.session_state.processed = True
@@ -502,4 +512,5 @@ if st.session_state.processed:
     if st.session_state.skipped:
         st.subheader("Skipped URLs and Reasons")
         st.table(pd.DataFrame(st.session_state.skipped))
+
 
