@@ -22,17 +22,17 @@ st.sidebar.header("About Content Gap Audit")
 st.sidebar.write(
     """This tool automates an SEO content coverage audit by:
 1. Extracting your page's H1 and subheadings (H2–H4).
-2. Using Google Gemini to generate relevant user queries (fan-outs).
-3. Comparing queries against your headings with OpenAI GPT to identify missing topics."""
+2. Using Google Gemini to generate relevant user queries (fan‑outs) with aggregation and deduplication.
+3. Comparing queries against your headings with OpenAI GPT to identify missing topics and recommend additions."""
 )
 
-# Load API keys
+# Load credentials from Streamlit secrets
 openai.api_key = st.secrets["openai"]["api_key"]
 gemini_api_key = st.secrets["google"]["gemini_api_key"]
 
-# Input URLs
+# URL input
 urls_input = st.text_area(
-    "Enter one URL per line to analyze headers and content gaps:",
+    "Enter one URL per line to audit:",
     placeholder="https://example.com/page1\nhttps://example.com/page2"
 )
 
@@ -46,7 +46,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Session state initialization
+# Session state defaults
 for key, default in {
     "last_urls": [],
     "processed": False,
@@ -59,7 +59,7 @@ for key, default in {
     if key not in st.session_state:
         st.session_state[key] = default
 
-# Parse URLs
+# Parse and dedupe input URLs
 urls = [u.strip() for u in urls_input.splitlines() if u.strip()] if urls_input else []
 total = len(urls)
 if urls:
@@ -75,29 +75,22 @@ if urls and st.session_state.last_urls != urls:
     st.session_state.skipped = []
     st.session_state.h1_fanout_cache = {}
 
-# Start audit trigger
+# Trigger audit
 start_clicked = st.button("Start Audit")
 if start_clicked and urls:
-    st.session_state.processed = False  # force fresh run
+    st.session_state.processed = False
 
-# Embedding similarity helpers
-STOPWORDS = {
-    "the", "and", "of", "in", "to", "a", "for", "with", "on", "about",
-    "vs", "vs.", "is", "are", "your", "what", "how", "why", "more",
-    "latest", "new"
-}
-
+# Short practical fix: embedding/similarity dedupe helpers
+STOPWORDS = {"the","and","of","in","to","a","for","with","on","about","vs","vs.","is","are","your","what","how","why","more","latest","new"}
 
 def content_words(s: str):
     tokens = re.findall(r"[A-Za-z0-9]+", s.lower())
     return [t for t in tokens if t not in STOPWORDS]
 
-
 def cosine(a: np.ndarray, b: np.ndarray):
     if np.linalg.norm(a) == 0 or np.linalg.norm(b) == 0:
         return 0.0
     return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
-
 
 def remove_component(vec: np.ndarray, anchor: np.ndarray):
     denom = np.dot(anchor, anchor)
@@ -105,7 +98,6 @@ def remove_component(vec: np.ndarray, anchor: np.ndarray):
         return vec
     proj = (np.dot(vec, anchor) / denom) * anchor
     return vec - proj
-
 
 def dedupe_queries(queries, raw_threshold=0.9, residual_threshold=0.5, embedding_model="text-embedding-ada-002"):
     if not queries:
@@ -152,6 +144,7 @@ def dedupe_queries(queries, raw_threshold=0.9, residual_threshold=0.5, embedding
                 removed.add(j)
     return kept
 
+# Gemini multi-call + aggregate + semantic dedupe fan-outs
 
 def fetch_query_fan_outs_multi(h1_text, attempts=3, temp=0.0):
     aggregated = []
@@ -174,20 +167,23 @@ def fetch_query_fan_outs_multi(h1_text, attempts=3, temp=0.0):
         except Exception as e:
             st.warning(f"Fan-out fetch attempt {attempt+1} failed: {e}")
         time.sleep(0.2)
+    # exact dedupe preserving order
     seen = set()
     unique_raw = []
     for q in aggregated:
         if q not in seen:
             seen.add(q)
             unique_raw.append(q)
+    # semantic dedupe
     return dedupe_queries(unique_raw)
 
+# Robust GPT JSON extraction
 
 def get_explanations(prompt, max_retries=2):
     system_msg = (
         "You are an SEO content gap auditor. Given the input, respond ONLY with a valid JSON array and nothing else. "
         "Each item must have exactly these keys: query (string), covered (true/false), and explanation (concise string). "
-        "Do not include any extra prose outside the JSON. Example: [{\"query\":\"...\",\"covered\":true,\"explanation\":\"...\"}]"
+        "Do not include extra prose. Example: [{\"query\":\"...\",\"covered\":true,\"explanation\":\"...\"}]"
     )
     messages = [
         {"role": "system", "content": system_msg},
@@ -224,16 +220,12 @@ def get_explanations(prompt, max_retries=2):
                     pass
             if attempt < max_retries:
                 messages.append({"role": "assistant", "content": text})
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            "The previous response was not valid JSON. Please output only the JSON array exactly as specified, nothing else. "
-                            "Example: [{\"query\":\"...\",\"covered\":true,\"explanation\":\"...\"}]"
-                        ),
-                    }
-                )
-                continue
+                messages.append({
+                    "role": "user", "content": (
+                        "Previous response was not valid JSON. Please output only the JSON array exactly as specified. "
+                        "Example: [{\"query\":\"...\",\"covered\":true,\"explanation\":\"...\"}]"
+                    )
+                })
         except Exception as e:
             last_raw = f"API error: {e}"
             if attempt < max_retries:
@@ -242,8 +234,7 @@ def get_explanations(prompt, max_retries=2):
     st.warning(f"OpenAI parse failure after {max_retries} attempts. Raw output:\n{last_raw}")
     return []
 
-
-# Main processing
+# Main audit loop
 if urls and not st.session_state.processed:
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -296,13 +287,11 @@ if urls and not st.session_state.processed:
         lines.extend(["", "2) User queries to cover:"])
         for q in queries:
             lines.append(f"- {q}")
-        lines.extend(
-            [
-                "",
-                "3) Return JSON array of objects with keys: query, covered, explanation.",
-                'Example: [{"query":"...","covered":true,"explanation":"..."}]',
-            ]
-        )
+        lines.extend([
+            "",
+            "3) Return JSON array of objects with keys: query, covered, explanation.",
+            'Example: [{"query":"...","covered":true,"explanation":"..."}]',
+        ])
         return "\n".join(lines)
 
     for idx, url in enumerate(urls):
@@ -329,25 +318,21 @@ if urls and not st.session_state.processed:
                 st.warning(f"⚠️ Skipped {url}: {err}.")
                 st.session_state.skipped.append({"Address": url, "Reason": err})
             continue
-
         if not h1 and not headings:
             st.warning(f"Skipped {url}: no H1 or subheadings found.")
             st.session_state.skipped.append({"Address": url, "Reason": "No H1 or subheadings found"})
             continue
-
         if h1 in st.session_state.h1_fanout_cache:
             fanouts = st.session_state.h1_fanout_cache[h1]
         else:
             fanouts = fetch_query_fan_outs_multi(h1, attempts=3, temp=0.0)
             st.session_state.h1_fanout_cache[h1] = fanouts
-
         if not fanouts:
             st.warning(f"Skipped {url}: no fan-out queries for H1 '{h1}'.")
             st.session_state.skipped.append(
                 {"Address": url, "Reason": f"No fan-out queries returned for H1: '{h1}'"}
             )
             continue
-
         prompt = build_prompt(h1, headings, fanouts)
         results = get_explanations(prompt)
         if not results:
@@ -356,18 +341,15 @@ if urls and not st.session_state.processed:
                 {"Address": url, "Reason": "OpenAI returned no results or parsing failed"}
             )
             continue
-
         covered = sum(1 for it in results if it.get("covered"))
         pct = round((covered / len(results)) * 100) if results else 0
         st.session_state.summary.append(
             {"Address": url, "Fan-out Count": len(fanouts), "Coverage (%)": pct}
         )
-
         missing = [it.get("query") for it in results if not it.get("covered")]
         st.session_state.actions.append(
             {"Address": url, "Recommended Sections to Add to Content": "; ".join(missing)}
         )
-
         row = {
             "Address": url,
             "H1-1": h1,
@@ -378,15 +360,13 @@ if urls and not st.session_state.processed:
             row[f"Query {i+1} Covered"] = "Yes" if it.get("covered") else "No"
             row[f"Query {i+1} Explanation"] = it.get("explanation", "")
         st.session_state.detailed.append(row)
-
     progress_bar.progress(100)
     status_text.text("Complete!")
     st.session_state.processed = True
 
-# Display / download final outputs
+# Display / download
 if st.session_state.processed:
     st.header("Results")
-
     if st.session_state.detailed:
         st.subheader("Detailed")
         df_det = pd.DataFrame(st.session_state.detailed)
@@ -394,7 +374,6 @@ if st.session_state.processed:
             "Download Detailed CSV", df_det.to_csv(index=False).encode("utf-8"), "detailed.csv", "text/csv"
         )
         st.dataframe(df_det)
-
     if st.session_state.summary:
         st.subheader("Summary")
         df_sum = pd.DataFrame(st.session_state.summary)
@@ -405,7 +384,6 @@ if st.session_state.processed:
             "Download Summary CSV", df_sum.to_csv(index=False).encode("utf-8"), "summary.csv", "text/csv"
         )
         st.dataframe(df_sum)
-
     if st.session_state.actions:
         st.subheader("Actions")
         df_act = pd.DataFrame(st.session_state.actions)
@@ -413,7 +391,6 @@ if st.session_state.processed:
             "Download Actions CSV", df_act.to_csv(index=False).encode("utf-8"), "actions.csv", "text/csv"
         )
         st.dataframe(df_act)
-
     if st.session_state.skipped:
         st.subheader("Skipped URLs and Reasons")
         st.table(pd.DataFrame(st.session_state.skipped))
