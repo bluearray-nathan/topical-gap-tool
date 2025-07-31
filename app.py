@@ -1,6 +1,5 @@
 import subprocess
 import sys
-
 # Install Playwright browser binaries if possible (non-fatal)
 subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=False)
 
@@ -26,16 +25,14 @@ st.sidebar.write(
     """This tool automates an SEO content coverage audit by:
 1. Extracting your page's H1 and subheadings (H2–H4).
 2. Using Google Gemini to generate relevant user queries (fan-outs).
-3. Pre-matching those queries semantically to existing headings.
-4. Using OpenAI GPT to adjudicate uncertain/missing queries and suggest headings.
-5. Producing nuanced coverage scores and actionable gap reports."""
+3. Comparing queries against your headings with OpenAI GPT to identify missing topics."""
 )
 
 # Load API keys
 openai.api_key = st.secrets["openai"]["api_key"]
 gemini_api_key = st.secrets["google"]["gemini_api_key"]
 
-# Input URLs directly
+# Input URLs
 urls_input = st.text_area(
     "Enter one URL per line to analyze headers and content gaps:",
     placeholder="https://example.com/page1\nhttps://example.com/page2"
@@ -62,14 +59,15 @@ if "last_urls" not in st.session_state:
     st.session_state.summary = []
     st.session_state.actions = []
     st.session_state.skipped = []
+    st.session_state.h1_fanout_cache = {}  # cache aggregated fan-outs per H1
 
-# Parse URLs
+# Parse and show count
 urls = [u.strip() for u in urls_input.splitlines() if u.strip()] if urls_input else []
 total = len(urls)
 if urls:
     st.write(f"Found {total} URLs to process.")
 
-# Reset when input changes
+# Reset if new input
 if urls and st.session_state.last_urls != urls:
     st.session_state.last_urls = urls
     st.session_state.processed = False
@@ -77,63 +75,137 @@ if urls and st.session_state.last_urls != urls:
     st.session_state.summary = []
     st.session_state.actions = []
     st.session_state.skipped = []
+    st.session_state.h1_fanout_cache = {}
 
-# Trigger
+# Start trigger
 start_clicked = st.button("Start Audit", key="start")
 if start_clicked and urls:
     st.session_state.processed = False  # force re-run
 
-# Embedding thresholds
-COVERED_THRESH = 0.8
-UNCERTAIN_THRESH = 0.6
+# Embedding-based dedupe helpers (short practical fix)
+STOPWORDS = {
+    "the", "and", "of", "in", "to", "a", "for", "with", "on", "about", "vs", "vs.",
+    "is", "are", "your", "what", "how", "why", "more", "latest", "new"
+}
 
-# Cosine similarity
-def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    if a is None or b is None:
-        return 0.0
-    norm_a = np.linalg.norm(a)
-    norm_b = np.linalg.norm(b)
-    if norm_a == 0 or norm_b == 0:
-        return 0.0
-    return float(np.dot(a, b) / (norm_a * norm_b))
 
-# Embedding retrieval with proper response handling
-def get_embeddings(texts, model="text-embedding-ada-002"):
+def content_words(s: str):
+    tokens = re.findall(r"[A-Za-z0-9]+", s.lower())
+    return [t for t in tokens if t not in STOPWORDS]
+
+
+def cosine(a: np.ndarray, b: np.ndarray):
+    if np.linalg.norm(a) == 0 or np.linalg.norm(b) == 0:
+        return 0.0
+    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
+
+
+def remove_component(vec: np.ndarray, anchor: np.ndarray):
+    denom = np.dot(anchor, anchor)
+    if denom == 0:
+        return vec
+    proj = (np.dot(vec, anchor) / denom) * anchor
+    return vec - proj
+
+
+def dedupe_queries(queries, raw_threshold=0.9, residual_threshold=0.5, embedding_model="text-embedding-ada-002"):
+    if not queries:
+        return []
+
     try:
-        resp = openai.embeddings.create(model=model, input=texts)
-        # Support both attribute-style and dict-style responses
-        data = None
-        if hasattr(resp, "data"):
-            data = resp.data
-        elif isinstance(resp, dict):
-            data = resp.get("data", [])
-        else:
-            data = []
-        embeddings = []
-        for item in data:
-            if hasattr(item, "embedding"):
-                embeddings.append(np.array(item.embedding, dtype=float))
-            elif isinstance(item, dict) and "embedding" in item:
-                embeddings.append(np.array(item["embedding"], dtype=float))
-            else:
-                embeddings.append(None)
-        return embeddings
-    except Exception as e:
-        st.warning(f"Embedding call failed: {e}")
-        return [None] * len(texts)
+        resp = openai.embeddings.create(model=embedding_model, input=queries)
+        query_vecs = [np.array(d["embedding"], dtype=float) for d in resp["data"]]
+    except Exception:
+        return queries  # fallback: no dedupe
 
-# Only run processing once per URL list
+    kept = []
+    removed = set()
+    anchor_cache = {}
+
+    for i, qi in enumerate(queries):
+        if i in removed:
+            continue
+        kept.append(qi)
+        vi = query_vecs[i]
+        for j in range(i + 1, len(queries)):
+            if j in removed:
+                continue
+            vj = query_vecs[j]
+            raw_sim = cosine(vi, vj)
+            if raw_sim < raw_threshold:
+                continue
+            shared = set(content_words(qi)) & set(content_words(queries[j]))
+            if shared:
+                anchor_text = " ".join(sorted(shared))
+                if anchor_text not in anchor_cache:
+                    try:
+                        a_resp = openai.embeddings.create(model=embedding_model, input=[anchor_text])
+                        anchor_cache[anchor_text] = np.array(a_resp["data"][0]["embedding"], dtype=float)
+                    except Exception:
+                        anchor_cache[anchor_text] = None
+                anchor_vec = anchor_cache.get(anchor_text)
+                if anchor_vec is not None:
+                    ri = remove_component(vi, anchor_vec)
+                    rj = remove_component(vj, anchor_vec)
+                    residual_sim = cosine(ri, rj)
+                else:
+                    residual_sim = raw_sim
+            else:
+                residual_sim = raw_sim
+
+            if residual_sim >= residual_threshold:
+                removed.add(j)
+    return kept
+
+
+# Multi-call fan-out aggregation
+def fetch_query_fan_outs_multi(h1_text, attempts=3, temp=0.1):
+    """Call Gemini multiple times, aggregate fanouts, then semantically dedupe."""
+    aggregated = []
+    for attempt in range(attempts):
+        endpoint = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"gemini-2.5-flash:generateContent?key={gemini_api_key}"
+        )
+        payload = {
+            "contents": [{"parts": [{"text": h1_text}]}],
+            "tools": [{"google_search": {}}],
+            "generationConfig": {"temperature": temp},
+        }
+        try:
+            r = requests.post(endpoint, json=payload, timeout=30)
+            r.raise_for_status()
+            cand = r.json().get("candidates", [{}])[0]
+            fanouts = cand.get("groundingMetadata", {}).get("webSearchQueries", [])
+            aggregated.extend(fanouts)
+        except Exception as e:
+            st.warning(f"Fan-out fetch attempt {attempt+1} failed: {e}")
+        time.sleep(0.5)  # small jitter
+    # first de-duplicate exact string duplicates while preserving order
+    seen = set()
+    unique_raw = []
+    for q in aggregated:
+        if q not in seen:
+            seen.add(q)
+            unique_raw.append(q)
+    # then apply semantic dedupe to collapse near-duplicates
+    deduped = dedupe_queries(unique_raw)
+    return deduped
+
+
+# Main processing
 if urls and not st.session_state.processed:
     progress_bar = st.progress(0)
     status_text = st.empty()
     start_time = time.time()
 
+    # reset previous
     st.session_state.detailed = []
     st.session_state.summary = []
     st.session_state.actions = []
     st.session_state.skipped = []
 
-    # Extract H1 and headings with fallback
+    # Helper: extract H1 + headings with fallback
     def extract_h1_and_headings(url):
         try:
             with sync_playwright() as p:
@@ -164,40 +236,8 @@ if urls and not st.session_state.processed:
         headings = [(tag.name.upper(), tag.get_text(strip=True)) for tag in soup.find_all(["h2", "h3", "h4"])]
         return h1, headings, None
 
-    # Gemini fan-out with retries + union/dedupe
-    def fetch_query_fan_outs(h1_text, tries=3, cap=12):
-        endpoint = (
-            f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"gemini-2.5-flash:generateContent?key={gemini_api_key}"
-        )
-        aggregated = []
-        seen = set()
-        backoff = 1
-        for attempt in range(tries):
-            payload = {
-                "contents": [{"parts": [{"text": h1_text}]}],
-                "tools": [{"google_search": {}}],
-                "generationConfig": {"temperature": 0.0},
-            }
-            try:
-                r = requests.post(endpoint, json=payload, timeout=30)
-                r.raise_for_status()
-                cand = r.json().get("candidates", [{}])[0]
-                fanouts = cand.get("groundingMetadata", {}).get("webSearchQueries", []) or []
-                for q in fanouts:
-                    if q not in seen:
-                        seen.add(q)
-                        aggregated.append(q)
-                if len(aggregated) >= cap:
-                    break
-            except Exception as e:
-                st.warning(f"Fan-out attempt {attempt+1} failed: {e}")
-            time.sleep(backoff)
-            backoff *= 2
-        return aggregated[:cap]
-
-    # Build prompt including prelabels
-    def build_prompt_with_prelabelling(h1, headings, prelabels):
+    # Helper: build GPT prompt
+    def build_prompt(h1, headings, queries):
         lines = [
             "I’m auditing this page for content gaps.",
             f"Main topic (H1): {h1}",
@@ -206,59 +246,33 @@ if urls and not st.session_state.processed:
         ]
         for lvl, txt in headings:
             lines.append(f"{lvl}: {txt}")
-        lines.append("")
-        lines.append("2) User search queries with preliminary semantic coverage (prelabel, best match heading, similarity):")
-        for p in prelabels:
-            lines.append(
-                json.dumps(
-                    {
-                        "query": p["query"],
-                        "prelabel": p["prelabel"],
-                        "best_match_heading": p.get("best_match_heading", ""),
-                        "similarity": round(p.get("similarity", 2), 2),
-                    }
-                )
-            )
+        lines.extend(["", "2) User queries to cover:"])
+        for q in queries:
+            lines.append(f"- {q}")
         lines.extend(
             [
                 "",
-                "3) Only consider queries with prelabel 'uncertain' or 'missing'.",
-                "For each such query, decide if it's truly missing or sufficiently covered.",
-                "Return a JSON array of objects. Each object must have:",
-                '  query: original query,',
-                '  covered: true/false (after review),',
-                '  explanation: concise reason if missing or why acceptable,',
-                '  suggested_heading: if missing, a proposed heading title (empty if covered),',
-                '  confidence: one of high, medium, low indicating how clear the gap is.',
-                "Example:",
-                "[",
-                '{"query":"lifecycle environmental impact comparison EV vs gasoline","covered":false,"explanation":"No section ties all lifecycle stages together.","suggested_heading":"EV vs Gasoline Cars: Full Lifecycle Environmental Impact","confidence":"high"},',
-                '{"query":"battery disposal environmental issues","covered":true,"explanation":"Recycling section partially covers this.","suggested_heading":"","confidence":"medium"}',
-                "]",
+                "3) Return JSON array of objects with keys: query, covered, explanation.",
+                'Example: [{"query":"...","covered":true,"explanation":"..."}]',
             ]
         )
         return "\n".join(lines)
 
-    # Call OpenAI to adjudicate gaps
-    def get_gap_assessments(prompt):
+    # Helper: call OpenAI
+    def get_explanations(prompt):
+        resp = openai.chat.completions.create(
+            model="gpt-4o", messages=[{"role": "user", "content": prompt}], temperature=0.1
+        )
+        txt = resp.choices[0].message.content.strip()
+        txt = re.sub(r"^```(?:json)?\s*", "", txt)
+        txt = re.sub(r"\s*```$", "", txt)
         try:
-            resp = openai.chat.completions.create(
-                model="gpt-4o", messages=[{"role": "user", "content": prompt}], temperature=0.1
-            )
-            txt = resp.choices[0].message.content.strip()
-            txt = re.sub(r"^```(?:json)?\s*", "", txt)
-            txt = re.sub(r"\s*```$", "", txt)
-            try:
-                arr = json.loads(txt)
-                return arr if isinstance(arr, list) else []
-            except Exception:
-                st.warning(f"Failed to parse GPT output as JSON. Raw: {txt}")
-                return []
-        except Exception as e:
-            st.warning(f"OpenAI call failed: {e}")
+            arr = json.loads(txt)
+            return arr if isinstance(arr, list) else []
+        except:
             return []
 
-    # Process each URL
+    # Loop
     for idx, url in enumerate(urls):
         elapsed = time.time() - start_time
         avg = elapsed / (idx + 1)
@@ -289,7 +303,13 @@ if urls and not st.session_state.processed:
             st.session_state.skipped.append({"Address": url, "Reason": "No H1 or subheadings found"})
             continue
 
-        fanouts = fetch_query_fan_outs(h1)
+        # Get aggregated & deduped fan-outs, caching by H1
+        if h1 in st.session_state.h1_fanout_cache:
+            fanouts = st.session_state.h1_fanout_cache[h1]
+        else:
+            fanouts = fetch_query_fan_outs_multi(h1, attempts=3, temp=0.1)
+            st.session_state.h1_fanout_cache[h1] = fanouts
+
         if not fanouts:
             st.warning(f"Skipped {url}: no fan-out queries for H1 '{h1}'.")
             st.session_state.skipped.append(
@@ -297,184 +317,57 @@ if urls and not st.session_state.processed:
             )
             continue
 
-        # Embedding pre-match
-        heading_texts = [f"{lvl}: {txt}" for lvl, txt in headings]
-        heading_embs = get_embeddings(heading_texts)
-        query_embs = get_embeddings(fanouts)
-        prelabels = []
-        for qi, q in enumerate(fanouts):
-            sims = []
-            for hi, h_emb in enumerate(heading_embs):
-                sims.append(cosine_similarity(query_embs[qi], h_emb) if query_embs[qi] is not None else 0.0)
-            best_sim = max(sims) if sims else 0.0
-            best_heading = heading_texts[sims.index(best_sim)] if sims else ""
-            if best_sim >= COVERED_THRESH:
-                label = "covered"
-            elif best_sim >= UNCERTAIN_THRESH:
-                label = "uncertain"
-            else:
-                label = "missing"
-            prelabels.append(
-                {
-                    "query": q,
-                    "best_match_heading": best_heading,
-                    "similarity": best_sim,
-                    "prelabel": label,
-                }
+        prompt = build_prompt(h1, headings, fanouts)
+        results = get_explanations(prompt)
+        if not results:
+            st.warning(f"Skipped {url}: OpenAI returned no usable output.")
+            st.session_state.skipped.append(
+                {"Address": url, "Reason": "OpenAI returned no results or parsing failed"}
             )
+            continue
 
-        # Determine which to send to GPT
-        to_review = [p for p in prelabels if p["prelabel"] in ("uncertain", "missing")]
-        gpt_results = []
-        if to_review:
-            prompt = build_prompt_with_prelabelling(h1, headings, to_review)
-            gpt_results = get_gap_assessments(prompt)
-
-        # Combine signals and compute weights
-        detailed_rows_for_url = []
-        total_weight = 0.0
-        for p in prelabels:
-            q = p["query"]
-            prelabel = p["prelabel"]
-            best_heading = p.get("best_match_heading", "")
-            similarity = p.get("similarity", 0.0)
-            gpt_entry = next((g for g in gpt_results if g.get("query", "") == q), None)
-
-            explanation = ""
-            suggested_heading = ""
-            confidence = ""
-            final_weight = 0.0
-            final_covered = False
-            gpt_covered = True  # default assume covered if no entry
-
-            if prelabel == "covered":
-                final_weight = 1.0
-                final_covered = True
-                explanation = "Pre-match semantic similarity indicates strong coverage."
-                confidence = "high"
-                if gpt_entry and not gpt_entry.get("covered", True):
-                    gpt_covered = False
-                    explanation = gpt_entry.get("explanation", "")
-                    suggested_heading = gpt_entry.get("suggested_heading", "")
-                    confidence = gpt_entry.get("confidence", "medium")
-                    if confidence == "high":
-                        final_weight = 0.5
-                    elif confidence == "medium":
-                        final_weight = 0.75
-                    else:
-                        final_weight = 0.9
-                    final_covered = final_weight >= 0.75
-            else:
-                if gpt_entry:
-                    gpt_covered = bool(gpt_entry.get("covered", False))
-                    confidence = gpt_entry.get("confidence", "medium")
-                    explanation = gpt_entry.get("explanation", "")
-                    suggested_heading = gpt_entry.get("suggested_heading", "")
-                    if gpt_entry.get("covered", False):
-                        final_weight = 1.0
-                        final_covered = True
-                    else:
-                        if prelabel == "uncertain":
-                            if confidence == "high":
-                                final_weight = 0.0
-                            elif confidence == "medium":
-                                final_weight = 0.3
-                            else:
-                                final_weight = 0.5
-                        else:  # missing
-                            if confidence == "high":
-                                final_weight = 0.0
-                            elif confidence == "medium":
-                                final_weight = 0.3
-                            else:
-                                final_weight = 0.5
-                        final_covered = final_weight >= 0.75
-                else:
-                    if prelabel == "uncertain":
-                        final_weight = 1.0
-                        final_covered = True
-                        explanation = "No GPT contradiction; treating uncertain as covered."
-                        confidence = "medium"
-                    else:
-                        final_weight = 0.0
-                        final_covered = False
-                        explanation = "No GPT response; treated as missing."
-                        confidence = "high"
-                        gpt_covered = False
-
-            total_weight += final_weight
-            row = {
-                "Address": url,
-                "H1-1": h1,
-                "Content Structure": " | ".join(f"{lvl}:{txt}" for lvl, txt in headings),
-                "Query": q,
-                "Prelabel": prelabel,
-                "Best Match Heading": best_heading,
-                "Similarity": round(similarity, 3),
-                "GPT Covered": gpt_covered,
-                "GPT Explanation": explanation,
-                "Suggested Heading": suggested_heading,
-                "Confidence": confidence,
-                "Final Weight": final_weight,
-                "Final Covered": final_covered,
-            }
-            st.session_state.detailed.append(row)
-            detailed_rows_for_url.append(row)
-
-        # Summary aggregation
-        num_queries = len(fanouts)
-        coverage_score = round((total_weight / num_queries) * 100, 1) if num_queries else 0
-        high_conf_gaps = sum(
-            1
-            for r in detailed_rows_for_url
-            if not r["Final Covered"] and r["Confidence"] == "high"
-        )
-        lower_conf_gaps = sum(
-            1
-            for r in detailed_rows_for_url
-            if not r["Final Covered"] and r["Confidence"] in ("medium", "low")
-        )
-        suggested = list({r["Suggested Heading"] for r in detailed_rows_for_url if r["Suggested Heading"]})
+        # Coverage summary (fan-out count uses deduped length)
+        covered = sum(1 for it in results if it.get("covered"))
+        pct = round((covered / len(results)) * 100) if results else 0
         st.session_state.summary.append(
-            {
-                "Address": url,
-                "Fan-out Count": num_queries,
-                "Coverage (%)": coverage_score,
-                "High-confidence gaps": high_conf_gaps,
-                "Lower-confidence gaps": lower_conf_gaps,
-                "Suggested Headings": "; ".join(suggested),
-            }
+            {"Address": url, "Fan-out Count": len(fanouts), "Coverage (%)": pct}
         )
 
-        # Actions
-        action_suggestions = []
-        for r in detailed_rows_for_url:
-            if not r["Final Covered"] and r["Suggested Heading"]:
-                action_suggestions.append(f"{r['Query']} -> {r['Suggested Heading']}")
+        # Actions: missing queries
+        missing = [it.get("query") for it in results if not it.get("covered")]
         st.session_state.actions.append(
             {
                 "Address": url,
-                "Recommended Sections to Add to Content": "; ".join(action_suggestions),
+                "Recommended Sections to Add to Content": "; ".join(missing),
             }
         )
 
-    # Finalize
+        # Detailed row
+        row = {
+            "Address": url,
+            "H1-1": h1,
+            "Content Structure": " | ".join(f"{lvl}:{txt}" for lvl, txt in headings),
+        }
+        for i, it in enumerate(results):
+            row[f"Query {i+1}"] = it.get("query", "")
+            row[f"Query {i+1} Covered"] = "Yes" if it.get("covered") else "No"
+            row[f"Query {i+1} Explanation"] = it.get("explanation", "")
+        st.session_state.detailed.append(row)
+
+    # finalize
     progress_bar.progress(100)
     status_text.text("Complete!")
     st.session_state.processed = True
 
-# Display / download results
+# Display/download
 if st.session_state.processed:
     st.header("Results")
 
     if st.session_state.detailed:
-        st.subheader("Detailed per-query breakdown")
+        st.subheader("Detailed")
         df_det = pd.DataFrame(st.session_state.detailed)
         st.download_button(
-            "Download Detailed CSV",
-            df_det.to_csv(index=False).encode("utf-8"),
-            "detailed.csv",
-            "text/csv",
+            "Download Detailed CSV", df_det.to_csv(index=False).encode("utf-8"), "detailed.csv", "text/csv"
         )
         st.dataframe(df_det)
     else:
@@ -483,14 +376,11 @@ if st.session_state.processed:
     if st.session_state.summary:
         st.subheader("Summary")
         df_sum = pd.DataFrame(st.session_state.summary)
-        base_cols = ["Address", "Fan-out Count", "Coverage (%)", "High-confidence gaps", "Lower-confidence gaps", "Suggested Headings"]
+        base_cols = ["Address", "Fan-out Count", "Coverage (%)"]
         ordered = [c for c in base_cols if c in df_sum.columns] + [c for c in df_sum.columns if c not in base_cols]
         df_sum = df_sum[ordered]
         st.download_button(
-            "Download Summary CSV",
-            df_sum.to_csv(index=False).encode("utf-8"),
-            "summary.csv",
-            "text/csv",
+            "Download Summary CSV", df_sum.to_csv(index=False).encode("utf-8"), "summary.csv", "text/csv"
         )
         st.dataframe(df_sum)
     else:
@@ -500,10 +390,7 @@ if st.session_state.processed:
         st.subheader("Actions")
         df_act = pd.DataFrame(st.session_state.actions)
         st.download_button(
-            "Download Actions CSV",
-            df_act.to_csv(index=False).encode("utf-8"),
-            "actions.csv",
-            "text/csv",
+            "Download Actions CSV", df_act.to_csv(index=False).encode("utf-8"), "actions.csv", "text/csv"
         )
         st.dataframe(df_act)
     else:
