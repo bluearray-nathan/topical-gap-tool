@@ -42,7 +42,82 @@ if urls_input:
     total = len(urls)
     st.write(f"Found {total} URLs to process.")
 
-    # Initialize progress and timer
+    # Start button to kick off processing
+    if st.button("Start Audit"):
+        # Initialize progress and timer
+        progress_bar = st.progress(0)
+        status_text  = st.empty()
+        start_time   = time.time()
+
+        # Prepare outputs
+        detailed = []
+        summary  = []
+        actions  = []  # recommended missing queries
+
+        # Processing loop
+        for idx, url in enumerate(urls):
+            elapsed   = time.time() - start_time
+            avg       = elapsed / (idx + 1)
+            remaining = total - (idx + 1)
+            eta_secs  = remaining * avg
+            mins      = int(eta_secs // 60)
+            secs      = int(eta_secs % 60)
+            eta_str   = f"{mins}m {secs}s" if mins>0 else f"{secs}s"
+            progress_bar.progress(int((idx+1)/total*100))
+            status_text.text(f"Processing {idx+1}/{total}. ETA: {eta_str}")
+
+            # Extract headings
+            h1, headings = extract_h1_and_headings(url)
+            if not h1 and not headings:
+                continue
+            # Fetch and analyze queries
+            queries = fetch_query_fan_outs(h1)
+            if not queries:
+                continue
+            prompt  = build_prompt(h1,headings,queries)
+            results = get_explanations(prompt)
+
+            covered = sum(1 for it in results if it.get("covered"))
+            pct     = round((covered/len(results))*100) if results else 0
+            summary.append({"Address":url,"Coverage (%)":pct})
+            # Record missing queries as actions
+            missing = [it.get("query") for it in results if not it.get("covered")]
+            actions.append({"Address":url, "Recommended Sections to Add to Content": "; ".join(missing)})
+
+            row = {"Address":url,"H1-1":h1,"Content Structure":" | ".join(f"{lvl}:{txt}" for lvl,txt in headings)}
+            for i, it in enumerate(results):
+                row[f"Query {i+1}"]             = it.get("query","")
+                row[f"Query {i+1} Covered"]     = "Yes" if it.get("covered") else "No"
+                row[f"Query {i+1} Explanation"] = it.get("explanation","")
+            detailed.append(row)
+
+        # Finalize
+        progress_bar.progress(100)
+        status_text.text("Complete!")
+
+        # Download
+        if detailed:
+            df_det = pd.DataFrame(detailed)
+            st.download_button("Download Detailed CSV", df_det.to_csv(index=False).encode('utf-8'), 'detailed.csv','text/csv')
+            st.dataframe(df_det)
+        else:
+            st.info("No detailed results to display.")
+
+        if summary:
+            df_sum = pd.DataFrame(summary)
+            st.download_button("Download Summary CSV", df_sum.to_csv(index=False).encode('utf-8'), 'summary.csv','text/csv')
+            st.dataframe(df_sum)
+        else:
+            st.info("No summary results to display.")
+
+        # Actions output
+        if actions:
+            df_act = pd.DataFrame(actions)
+            st.download_button("Download Actions CSV", df_act.to_csv(index=False).encode('utf-8'), 'actions.csv','text/csv')
+            st.dataframe(df_act)
+        else:
+            st.info("No actions to display.")
+
     progress_bar = st.progress(0)
     status_text  = st.empty()
     start_time   = time.time()
@@ -195,6 +270,7 @@ if urls_input:
         st.dataframe(df_act)
     else:
         st.info("No actions to display.")
+
 
 
 
