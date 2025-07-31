@@ -50,7 +50,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Initialize session state if needed
+# Session state initialization
 if "last_urls" not in st.session_state:
     st.session_state.last_urls = []
     st.session_state.processed = False
@@ -65,7 +65,7 @@ total = len(urls)
 if urls:
     st.write(f"Found {total} URLs to process.")
 
-# If the input changed, reset processed state
+# Reset if input changed
 if urls and st.session_state.last_urls != urls:
     st.session_state.last_urls = urls
     st.session_state.processed = False
@@ -74,20 +74,19 @@ if urls and st.session_state.last_urls != urls:
     st.session_state.actions = []
     st.session_state.skipped = []
 
-# Trigger
+# Trigger processing
 start_clicked = st.button("Start Audit", key="start")
 
-# Only run audit if requested and not already done for this input
 if start_clicked and urls:
     st.session_state.processed = False  # force fresh run
 
+# Main processing (only once per URL set)
 if urls and not st.session_state.processed:
-    # Begin processing
     progress_bar = st.progress(0)
     status_text = st.empty()
     start_time = time.time()
 
-    # Clear previous just in case
+    # Clear previous
     st.session_state.detailed = []
     st.session_state.summary = []
     st.session_state.actions = []
@@ -124,7 +123,7 @@ if urls and not st.session_state.processed:
         headings = [(tag.name.upper(), tag.get_text(strip=True)) for tag in soup.find_all(["h2", "h3", "h4"])]
         return h1, headings, None
 
-    # Helper: fetch fan-out queries with low randomness
+    # Helper: fetch fan-out queries from Gemini with deterministic temperature
     def fetch_query_fan_outs(h1_text):
         endpoint = (
             f"https://generativelanguage.googleapis.com/v1beta/models/"
@@ -133,7 +132,7 @@ if urls and not st.session_state.processed:
         payload = {
             "contents": [{"parts": [{"text": h1_text}]}],
             "tools": [{"google_search": {}}],
-            "generationConfig": {"temperature": 0.0},  # deterministic fan-outs
+            "generationConfig": {"temperature": 0.0},  # low randomness
         }
         try:
             r = requests.post(endpoint, json=payload, timeout=30)
@@ -144,7 +143,7 @@ if urls and not st.session_state.processed:
             st.warning(f"Fan-out fetch failed: {e}")
             return []
 
-    # Helper: build prompt
+    # Helper: build GPT prompt
     def build_prompt(h1, headings, queries):
         lines = [
             "I’m auditing this page for content gaps.",
@@ -180,7 +179,7 @@ if urls and not st.session_state.processed:
         except:
             return []
 
-    # Loop through URLs
+    # Loop over URLs
     for idx, url in enumerate(urls):
         elapsed = time.time() - start_time
         avg = elapsed / (idx + 1)
@@ -211,15 +210,15 @@ if urls and not st.session_state.processed:
             st.session_state.skipped.append({"Address": url, "Reason": "No H1 or subheadings found"})
             continue
 
-        queries = fetch_query_fan_outs(h1)
-        if not queries:
+        fanouts = fetch_query_fan_outs(h1)
+        if not fanouts:
             st.warning(f"Skipped {url}: no fan-out queries for H1 '{h1}'.")
             st.session_state.skipped.append(
                 {"Address": url, "Reason": f"No fan-out queries returned for H1: '{h1}'"}
             )
             continue
 
-        prompt = build_prompt(h1, headings, queries)
+        prompt = build_prompt(h1, headings, fanouts)
         results = get_explanations(prompt)
         if not results:
             st.warning(f"Skipped {url}: OpenAI returned no usable output.")
@@ -228,15 +227,23 @@ if urls and not st.session_state.processed:
             )
             continue
 
+        # Coverage and summary (with fan-out count)
         covered = sum(1 for it in results if it.get("covered"))
         pct = round((covered / len(results)) * 100) if results else 0
-        st.session_state.summary.append({"Address": url, "Coverage (%)": pct})
-
-        missing = [it.get("query") for it in results if not it.get("covered")]
-        st.session_state.actions.append(
-            {"Address": url, "Recommended Sections to Add to Content": "; ".join(missing)}
+        st.session_state.summary.append(
+            {"Address": url, "Fan-out Count": len(fanouts), "Coverage (%)": pct}
         )
 
+        # Actions: missing queries
+        missing = [it.get("query") for it in results if not it.get("covered")]
+        st.session_state.actions.append(
+            {
+                "Address": url,
+                "Recommended Sections to Add to Content": "; ".join(missing),
+            }
+        )
+
+        # Detailed per-query breakdown
         row = {
             "Address": url,
             "H1-1": h1,
@@ -253,10 +260,11 @@ if urls and not st.session_state.processed:
     status_text.text("Complete!")
     st.session_state.processed = True
 
-# Display/download results if available
+# Display / download results
 if st.session_state.processed:
     st.header("Results")
 
+    # Detailed
     if st.session_state.detailed:
         st.subheader("Detailed")
         df_det = pd.DataFrame(st.session_state.detailed)
@@ -267,9 +275,14 @@ if st.session_state.processed:
     else:
         st.info("No detailed results to display.")
 
+    # Summary with ordered columns
     if st.session_state.summary:
         st.subheader("Summary")
         df_sum = pd.DataFrame(st.session_state.summary)
+        # ensure Address, Fan-out Count, Coverage (%) ordering
+        base_cols = ["Address", "Fan-out Count", "Coverage (%)"]
+        ordered = [c for c in base_cols if c in df_sum.columns] + [c for c in df_sum.columns if c not in base_cols]
+        df_sum = df_sum[ordered]
         st.download_button(
             "Download Summary CSV", df_sum.to_csv(index=False).encode("utf-8"), "summary.csv", "text/csv"
         )
@@ -277,6 +290,7 @@ if st.session_state.processed:
     else:
         st.info("No summary results to display.")
 
+    # Actions
     if st.session_state.actions:
         st.subheader("Actions")
         df_act = pd.DataFrame(st.session_state.actions)
@@ -287,9 +301,9 @@ if st.session_state.processed:
     else:
         st.info("No actions to display.")
 
+    # Skipped
     if st.session_state.skipped:
         st.subheader("Skipped URLs and Reasons")
         st.table(pd.DataFrame(st.session_state.skipped))
-
 
 
