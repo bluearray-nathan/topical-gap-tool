@@ -23,13 +23,13 @@ st.sidebar.header("About Content Gap Audit")
 st.sidebar.write(
     """This tool automates an SEO content coverage audit by:
 1. Extracting your page's H1 and subheadings (H2–H4).
-2. Using Google Gemini to generate relevant user queries (fan‑outs).
+2. Using Google Gemini to generate relevant user queries (fan-outs).
 3. Comparing queries against your headings with OpenAI GPT to identify missing topics."""
 )
 
-# Load API keys from Streamlit secrets
-openai.api_key = st.secrets["openai"]["api_key"]
-gemini_api_key = st.secrets["google"]["gemini_api_key"]
+# Load API keys
+openai.api_key    = st.secrets["openai"]["api_key"]
+gemini_api_key    = st.secrets["google"]["gemini_api_key"]
 
 # Input URLs directly
 urls_input = st.text_area(
@@ -54,20 +54,19 @@ if urls_input:
     urls = [u.strip() for u in urls_input.splitlines() if u.strip()]
     total = len(urls)
     st.write(f"Found {total} URLs to process.")
-
-    # Start button to kick off processing
+    
     if st.button("Start Audit"):
-        # Initialize progress and timer
+        # Initialize
         progress_bar = st.progress(0)
         status_text  = st.empty()
         start_time   = time.time()
-
+        
         # Prepare outputs
         detailed = []
         summary  = []
         actions  = []
-
-        # Helper: extract H1 + headings via Playwright with fallback
+        
+        # Helpers
         def extract_h1_and_headings(url):
             try:
                 with sync_playwright() as p:
@@ -90,8 +89,7 @@ if urls_input:
             h1 = soup.find("h1").get_text(strip=True) if soup.find("h1") else ""
             headings = [(tag.name.upper(), tag.get_text(strip=True)) for tag in soup.find_all(["h2","h3","h4"])]
             return h1, headings
-
-        # Helper: fetch query fan-outs via Google Gemini
+        
         def fetch_query_fan_outs(h1_text):
             endpoint = (
                 f"https://generativelanguage.googleapis.com/v1beta/models/"
@@ -108,10 +106,9 @@ if urls_input:
                 cand = r.json().get("candidates", [{}])[0]
                 return cand.get("groundingMetadata", {}).get("webSearchQueries", [])
             except Exception as e:
-                st.warning(f"Fan‑out fetch failed: {e}")
+                st.warning(f"Fan-out fetch failed: {e}")
                 return []
-
-        # Helper: build GPT prompt
+        
         def build_prompt(h1, headings, queries):
             lines = [
                 "I’m auditing this page for content gaps.",
@@ -129,8 +126,7 @@ if urls_input:
                 "Example: [{\"query\":\"...\",\"covered\":true,\"explanation\":\"...\"}]"
             ])
             return "\n".join(lines)
-
-        # Helper: call OpenAI and parse JSON
+        
         def get_explanations(prompt):
             resp = openai.chat.completions.create(
                 model="gpt-4o",
@@ -145,8 +141,8 @@ if urls_input:
                 return arr if isinstance(arr, list) else []
             except:
                 return []
-
-        # Loop through URLs
+        
+        # Processing
         for idx, url in enumerate(urls):
             elapsed   = time.time() - start_time
             avg       = elapsed / (idx + 1)
@@ -170,8 +166,7 @@ if urls_input:
             covered = sum(1 for it in results if it.get("covered"))
             pct     = round((covered / len(results)) * 100) if results else 0
             summary.append({"Address": url, "Coverage (%)": pct})
-
-            missing = [it.get("query") for it in results if not it.get("covered")] 
+            missing = [it.get("query") for it in results if not it.get("covered")]
             actions.append({"Address": url, "Recommended Sections to Add to Content": "; ".join(missing)})
 
             row = {"Address": url, "H1-1": h1, "Content Structure": " | ".join(f"{lvl}:{txt}" for lvl, txt in headings)}
@@ -188,8 +183,39 @@ if urls_input:
         # Outputs
         if detailed:
             df_det = pd.DataFrame(detailed)
-            st.download_button("Download Detailed CSV", df_det.
-```
+            st.download_button(
+                "Download Detailed CSV",
+                df_det.to_csv(index=False).encode('utf-8'),
+                'detailed.csv',
+                'text/csv'
+            )
+            st.dataframe(df_det)
+        else:
+            st.info("No detailed results to display.")
+
+        if summary:
+            df_sum = pd.DataFrame(summary)
+            st.download_button(
+                "Download Summary CSV",
+                df_sum.to_csv(index=False).encode('utf-8'),
+                'summary.csv',
+                'text/csv'
+            )
+            st.dataframe(df_sum)
+        else:
+            st.info("No summary results to display.")
+
+        if actions:
+            df_act = pd.DataFrame(actions)
+            st.download_button(
+                "Download Actions CSV",
+                df_act.to_csv(index=False).encode('utf-8'),
+                'actions.csv',
+                'text/csv'
+            )
+            st.dataframe(df_act)
+        else:
+            st.info("No actions to display.")
 
 
 
