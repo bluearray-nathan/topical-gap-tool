@@ -19,7 +19,6 @@ import openai
 st.set_page_config(page_title="Content Gap Audit", layout="wide")
 st.title("🔍 Content Gap Audit Tool")
 
-# Sidebar explanation
 st.sidebar.header("About Content Gap Audit")
 st.sidebar.write(
     """This tool automates an SEO content coverage audit by:
@@ -28,7 +27,7 @@ st.sidebar.write(
 3. Comparing queries against your headings with OpenAI GPT to identify missing topics."""
 )
 
-# Load API keys
+# Load API keys from secrets
 openai.api_key = st.secrets["openai"]["api_key"]
 gemini_api_key = st.secrets["google"]["gemini_api_key"]
 
@@ -51,23 +50,29 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Session state init
+# Session state initialization with fallback
 if "last_urls" not in st.session_state:
     st.session_state.last_urls = []
+if "processed" not in st.session_state:
     st.session_state.processed = False
+if "detailed" not in st.session_state:
     st.session_state.detailed = []
+if "summary" not in st.session_state:
     st.session_state.summary = []
+if "actions" not in st.session_state:
     st.session_state.actions = []
+if "skipped" not in st.session_state:
     st.session_state.skipped = []
-    st.session_state.h1_fanout_cache = {}  # cache aggregated fan-outs per H1
+if "h1_fanout_cache" not in st.session_state:
+    st.session_state.h1_fanout_cache = {}
 
-# Parse and show count
+# Parse URLs
 urls = [u.strip() for u in urls_input.splitlines() if u.strip()] if urls_input else []
 total = len(urls)
 if urls:
     st.write(f"Found {total} URLs to process.")
 
-# Reset if new input
+# Reset if input changed
 if urls and st.session_state.last_urls != urls:
     st.session_state.last_urls = urls
     st.session_state.processed = False
@@ -77,12 +82,12 @@ if urls and st.session_state.last_urls != urls:
     st.session_state.skipped = []
     st.session_state.h1_fanout_cache = {}
 
-# Start trigger
+# Trigger
 start_clicked = st.button("Start Audit", key="start")
 if start_clicked and urls:
-    st.session_state.processed = False  # force re-run
+    st.session_state.processed = False  # force fresh run
 
-# Embedding-based dedupe helpers (short practical fix)
+# Embedding dedupe helpers (short practical fix)
 STOPWORDS = {
     "the", "and", "of", "in", "to", "a", "for", "with", "on", "about", "vs", "vs.",
     "is", "are", "your", "what", "how", "why", "more", "latest", "new"
@@ -158,8 +163,8 @@ def dedupe_queries(queries, raw_threshold=0.9, residual_threshold=0.5, embedding
     return kept
 
 
-# Multi-call fan-out aggregation
-def fetch_query_fan_outs_multi(h1_text, attempts=3, temp=0.1):
+# Multi-call fan-out aggregation with dedupe
+def fetch_query_fan_outs_multi(h1_text, attempts=3, temp=0.0):
     """Call Gemini multiple times, aggregate fanouts, then semantically dedupe."""
     aggregated = []
     for attempt in range(attempts):
@@ -180,15 +185,17 @@ def fetch_query_fan_outs_multi(h1_text, attempts=3, temp=0.1):
             aggregated.extend(fanouts)
         except Exception as e:
             st.warning(f"Fan-out fetch attempt {attempt+1} failed: {e}")
-        time.sleep(0.5)  # small jitter
-    # first de-duplicate exact string duplicates while preserving order
+        time.sleep(0.2)  # small jitter to avoid being too bursty
+
+    # remove exact duplicates preserving order
     seen = set()
     unique_raw = []
     for q in aggregated:
         if q not in seen:
             seen.add(q)
             unique_raw.append(q)
-    # then apply semantic dedupe to collapse near-duplicates
+
+    # semantic dedupe
     deduped = dedupe_queries(unique_raw)
     return deduped
 
@@ -205,7 +212,7 @@ if urls and not st.session_state.processed:
     st.session_state.actions = []
     st.session_state.skipped = []
 
-    # Helper: extract H1 + headings with fallback
+    # Helper: extract H1 + headings (Playwright fallback to cloudscraper)
     def extract_h1_and_headings(url):
         try:
             with sync_playwright() as p:
@@ -236,7 +243,7 @@ if urls and not st.session_state.processed:
         headings = [(tag.name.upper(), tag.get_text(strip=True)) for tag in soup.find_all(["h2", "h3", "h4"])]
         return h1, headings, None
 
-    # Helper: build GPT prompt
+    # Build prompt for GPT
     def build_prompt(h1, headings, queries):
         lines = [
             "I’m auditing this page for content gaps.",
@@ -258,7 +265,7 @@ if urls and not st.session_state.processed:
         )
         return "\n".join(lines)
 
-    # Helper: call OpenAI
+    # Call OpenAI
     def get_explanations(prompt):
         resp = openai.chat.completions.create(
             model="gpt-4o", messages=[{"role": "user", "content": prompt}], temperature=0.1
@@ -272,7 +279,7 @@ if urls and not st.session_state.processed:
         except:
             return []
 
-    # Loop
+    # Loop through URLs
     for idx, url in enumerate(urls):
         elapsed = time.time() - start_time
         avg = elapsed / (idx + 1)
@@ -303,11 +310,11 @@ if urls and not st.session_state.processed:
             st.session_state.skipped.append({"Address": url, "Reason": "No H1 or subheadings found"})
             continue
 
-        # Get aggregated & deduped fan-outs, caching by H1
+        # Aggregate fan-outs per H1 with caching
         if h1 in st.session_state.h1_fanout_cache:
             fanouts = st.session_state.h1_fanout_cache[h1]
         else:
-            fanouts = fetch_query_fan_outs_multi(h1, attempts=3, temp=0.1)
+            fanouts = fetch_query_fan_outs_multi(h1, attempts=3, temp=0.0)
             st.session_state.h1_fanout_cache[h1] = fanouts
 
         if not fanouts:
@@ -326,7 +333,7 @@ if urls and not st.session_state.processed:
             )
             continue
 
-        # Coverage summary (fan-out count uses deduped length)
+        # Summary with fan-out count
         covered = sum(1 for it in results if it.get("covered"))
         pct = round((covered / len(results)) * 100) if results else 0
         st.session_state.summary.append(
@@ -342,7 +349,7 @@ if urls and not st.session_state.processed:
             }
         )
 
-        # Detailed row
+        # Detailed breakdown
         row = {
             "Address": url,
             "H1-1": h1,
@@ -359,7 +366,7 @@ if urls and not st.session_state.processed:
     status_text.text("Complete!")
     st.session_state.processed = True
 
-# Display/download
+# Display / download results
 if st.session_state.processed:
     st.header("Results")
 
@@ -399,5 +406,6 @@ if st.session_state.processed:
     if st.session_state.skipped:
         st.subheader("Skipped URLs and Reasons")
         st.table(pd.DataFrame(st.session_state.skipped))
+
 
 
