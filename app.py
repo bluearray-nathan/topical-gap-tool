@@ -27,9 +27,9 @@ st.sidebar.write(
 )
 
 # Fixed settings (no user adjustment)
-gemini_temp = 1  # fan-out diversity
+gemini_temp = 0.6  # fan-out diversity
 gpt_temp = 0.1     # gap reasoning temperature
-attempts = 1       # number of Gemini aggregation calls
+attempts = 3       # number of Gemini aggregation calls
 
 # Load credentials from secrets
 openai.api_key = st.secrets["openai"]["api_key"]
