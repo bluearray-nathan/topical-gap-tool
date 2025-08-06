@@ -117,7 +117,7 @@ def remove_component(vec: np.ndarray, anchor: np.ndarray):
     proj = (np.dot(vec, anchor) / denom) * anchor
     return vec - proj
 
-def dedupe_queries(queries, raw_threshold=0.9, residual_threshold=0.5, embedding_model="text-embedding-ada-002"):
+def dedupe_queries(queries, raw_threshold=0.9, residual_threshold=0, embedding_model="text-embedding-ada-002"):
     if not queries:
         return []
     try:
