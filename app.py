@@ -29,7 +29,7 @@ st.sidebar.write(
 # Fixed settings (no user adjustment)
 gemini_temp = 0.4  # fan-out diversity
 gpt_temp = 0.1     # gap reasoning temperature
-attempts = 1       # number of Gemini aggregation calls
+attempts = 3       # number of Gemini aggregation calls
 candidate_count = 5  # number of candidates per Gemini call
 
 # Load credentials from secrets
