@@ -29,7 +29,7 @@ st.sidebar.write(
 # Fixed settings (no user adjustment)
 gemini_temp = 0.4  # fan-out diversity
 gpt_temp = 0.1     # gap reasoning temperature
-attempts = 1       # number of Gemini aggregation calls
+attempts = 2       # number of Gemini aggregation calls
 
 # Load credentials from secrets
 openai.api_key = st.secrets["openai"]["api_key"]
@@ -117,7 +117,7 @@ def remove_component(vec: np.ndarray, anchor: np.ndarray):
     proj = (np.dot(vec, anchor) / denom) * anchor
     return vec - proj
 
-def dedupe_queries(queries, raw_threshold=1, residual_threshold=1, embedding_model="text-embedding-ada-002"):
+def dedupe_queries(queries, raw_threshold=0.9, residual_threshold=0, embedding_model="text-embedding-ada-002"):
     if not queries:
         return []
     try:
