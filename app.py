@@ -30,7 +30,7 @@ st.sidebar.write(
 gemini_temp = 0.4  # fan-out diversity
 gpt_temp = 0.1     # gap reasoning temperature
 attempts = 1       # number of Gemini aggregation calls
-candidate_count = 10  # number of candidates per Gemini call
+candidate_count = 5  # number of candidates per Gemini call
 
 # Load credentials from secrets
 openai.api_key = st.secrets["openai"]["api_key"]
