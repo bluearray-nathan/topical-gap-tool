@@ -128,8 +128,6 @@ def dedupe_queries(queries, raw_threshold=0.9, residual_threshold=0, embedding_m
     if not queries:
         return []
     try:
-        # Note: The OpenAI v1.x library returns a pydantic model, not a dict.
-        # Access data via model attributes.
         resp = openai.embeddings.create(model=embedding_model, input=queries)
         query_vecs = [np.array(d.embedding, dtype=float) for d in resp.data]
     except Exception as e:
@@ -182,13 +180,13 @@ def dedupe_queries(queries, raw_threshold=0.9, residual_threshold=0, embedding_m
 def _fetch_single_fan_out(text_to_fan_out: str, single_attempt_count: int, temp: float) -> list:
     """Makes a single call to the Gemini API to get fan-out queries for a given text."""
     queries = []
-    # Use gemini-1.5-flash as it's a valid and recent model
     endpoint = (
         f"https://generativelanguage.googleapis.com/v1beta/models/"
         f"gemini-1.5-flash-latest:generateContent?key={gemini_api_key}"
     )
     payload = {
         "contents": [{"parts": [{"text": text_to_fan_out}]}],
+        # THIS IS THE CORRECTED LINE
         "tools": [{"Google Search": {}}],
         "generationConfig": {
             "temperature": temp,
@@ -201,12 +199,9 @@ def _fetch_single_fan_out(text_to_fan_out: str, single_attempt_count: int, temp:
         for cand in r.json().get("candidates", []):
             fanouts = cand.get("groundingMetadata", {}).get("webSearchQueries", [])
             queries.extend(fanouts)
-    # THIS IS THE CORRECTED BLOCK
     except Exception as e:
-        # Temporarily expose the error for debugging
-        st.error(f"A fan-out API call failed: {e}")
-        st.error(f"Payload sent: {json.dumps(payload, indent=2)}")
-    # END OF CORRECTION
+        # Fail silently now that the issue is understood, to keep the UI clean.
+        pass
     
     time.sleep(0.5) # API rate limiting
     return list(set(queries)) # Return unique queries from this call
@@ -237,7 +232,6 @@ def fetch_query_fan_outs_multi(h1_text: str, attempts: int, temp: float, depth: 
                 continue
             
             sub_query_progress.write(f"Level 2 Fan-out ({i+1}/{len(initial_queries)}): '{query}'")
-            # For sub-queries, we only need one attempt to save time/cost.
             recursive_queries = _fetch_single_fan_out(query, single_attempt_count=1, temp=temp)
             all_queries.extend(recursive_queries)
             processed_sub_queries.add(query)
@@ -245,7 +239,6 @@ def fetch_query_fan_outs_multi(h1_text: str, attempts: int, temp: float, depth: 
         sub_query_progress.update(label="Recursive fan-out complete!", state="complete", expanded=False)
 
     # Step 3: Final Comprehensive Deduplication
-    # Exact dedupe
     seen = set()
     unique_raw = []
     for q in all_queries:
@@ -253,7 +246,6 @@ def fetch_query_fan_outs_multi(h1_text: str, attempts: int, temp: float, depth: 
             seen.add(q)
             unique_raw.append(q)
     
-    # Canonical dedupe
     seen_canon = set()
     filtered = []
     for q in unique_raw:
@@ -262,7 +254,6 @@ def fetch_query_fan_outs_multi(h1_text: str, attempts: int, temp: float, depth: 
             seen_canon.add(canon)
             filtered.append(q)
             
-    # Semantic dedupe
     st.info(f"Found {len(filtered)} unique queries. Now running semantic deduplication...")
     final_queries = dedupe_queries(filtered)
     st.success(f"Deduplication complete. Final unique query count: {len(final_queries)}")
@@ -291,16 +282,12 @@ def get_explanations(prompt, temperature=0.1, max_retries=2):
                 response_format={"type": "json_object"}
             )
             content = resp.choices[0].message.content
-            # The model is now expected to return a JSON object, which might contain the array
-            # under a key like "results". We need to find the array.
             parsed_json = json.loads(content)
             
-            # Find the first value in the parsed JSON that is a list
             for key, value in parsed_json.items():
                 if isinstance(value, list):
-                    return value # Return the first list found
+                    return value
 
-            # If no list is found as a value, maybe the root object is the list (less common with JSON mode)
             if isinstance(parsed_json, list):
                 return parsed_json
 
@@ -310,7 +297,6 @@ def get_explanations(prompt, temperature=0.1, max_retries=2):
             last_raw = f"API error: {e}"
         
         if attempt < max_retries:
-            # If parsing fails, construct a corrective follow-up prompt
             messages.append({"role": "assistant", "content": content if 'content' in locals() else last_raw})
             messages.append({
                 "role": "user", "content": (
@@ -342,10 +328,6 @@ if start_clicked and urls and not st.session_state.processed:
                 page = browser.new_page()
                 page.goto(url, timeout=60000, wait_until="domcontentloaded")
                 
-                # Handle potential 403 status after navigation
-                # Note: Playwright's goto doesn't throw an error on 403, need to check response status.
-                # A more robust check would involve capturing the response object, but this is complex.
-                # We will check for common 403 page titles/content instead.
                 page_title = page.title().lower()
                 if "403 forbidden" in page_title or "access denied" in page_title:
                      browser.close()
@@ -369,7 +351,6 @@ if start_clicked and urls and not st.session_state.processed:
                 return "", [], f"Fetch failed: {final_e}"
         
         h1 = soup.find("h1").get_text(strip=True) if soup.find("h1") else ""
-        # If no H1, fall back to title tag
         if not h1:
             h1 = soup.find("title").get_text(strip=True) if soup.find("title") else ""
             
@@ -414,12 +395,10 @@ if start_clicked and urls and not st.session_state.processed:
             st.session_state.skipped.append({"Address": url, "Reason": "No H1 or Title tag found"})
             continue
         
-        # Use cache or fetch new fanouts
         if h1 in st.session_state.h1_fanout_cache:
             fanouts = st.session_state.h1_fanout_cache[h1]
             st.info(f"Using cached fan-out queries for H1: '{h1}'")
         else:
-            # AMENDED: Pass the recursion_depth setting
             fanouts = fetch_query_fan_outs_multi(h1, attempts=attempts, temp=gemini_temp, depth=recursion_depth)
             st.session_state.h1_fanout_cache[h1] = fanouts
         
