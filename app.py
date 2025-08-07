@@ -90,9 +90,17 @@ if urls and st.session_state.last_urls != urls:
     st.session_state.fanout_layer2_cache.clear()
 
 # --- Helper: Fetch Fan-Out Queries via Gemini ---
+from requests.exceptions import ReadTimeout
+
 def fetch_query_fan_outs_multi(text, attempts=1, temp=0.0):
+    """
+    Generate fan-out queries via Gemini, with retries on ReadTimeout.
+    text: input text to expand
+    attempts: how many separate calls to make
+    temp: temperature for generation
+    """
     queries = []
-    for _ in range(attempts):
+    for attempt_i in range(attempts):
         endpoint = (
             f"https://generativelanguage.googleapis.com/v1beta/models/"
             f"gemini-2.5-flash:generateContent?key={gemini_api_key}"
@@ -102,15 +110,30 @@ def fetch_query_fan_outs_multi(text, attempts=1, temp=0.0):
             "tools": [{"google_search": {}}],
             "generationConfig": {"temperature": temp, "candidateCount": candidate_count},
         }
+        # Retry loop for transient read timeouts
+        response = None
+        for retry in range(3):
+            try:
+                response = requests.post(endpoint, json=payload, timeout=60)
+                response.raise_for_status()
+                break
+            except ReadTimeout:
+                st.warning(f"ReadTimeout on fan-out fetch for '{text}' (attempt {retry+1}/3), retrying...")
+                time.sleep(1)
+                continue
+            except Exception as e:
+                st.warning(f"Fan-out fetch failed for '{text}': {e}")
+                break
+        if not response:
+            continue
         try:
-            response = requests.post(endpoint, json=payload, timeout=60)
-            response.raise_for_status()
-            for cand in response.json().get("candidates", []):
+            data = response.json().get("candidates", [])
+            for cand in data:
                 queries.extend(
                     cand.get("groundingMetadata", {}).get("webSearchQueries", []) or []
                 )
         except Exception as e:
-            st.warning(f"Fan-out fetch failed for '{text}': {e}")
+            st.warning(f"Error parsing fan-out response JSON for '{text}': {e}")
     return queries
 
 # --- Helper: Extract H1, Headings, and Body Text ---
@@ -283,6 +306,7 @@ if st.session_state.processed:
     if st.session_state.skipped:
         st.subheader("Skipped URLs & Reasons")
         st.table(pd.DataFrame(st.session_state.skipped))
+
 
 
 
