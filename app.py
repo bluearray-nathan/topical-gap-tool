@@ -172,7 +172,7 @@ def fetch_query_fan_outs_multi(h1_text, attempts=3, temp=0.0):
         )
         payload = {
             "contents": [{"parts": [{"text": h1_text}]}],
-            "tools": [{"Google Search": {}}],
+            "tools": [{"google_search": {}}],
             "generationConfig": {
                 "temperature": temp,
                 "candidateCount": candidate_count
@@ -423,6 +423,11 @@ if st.session_state.processed:
     if st.session_state.skipped:
         st.subheader("Skipped URLs and Reasons")
         st.table(pd.DataFrame(st.session_state.skipped))
+
+
+
+
+
 
 
 
