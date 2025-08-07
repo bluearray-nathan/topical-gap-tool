@@ -1,6 +1,5 @@
 import subprocess
 import sys
-# This command ensures the browser needed by Playwright is installed.
 subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=False)
 
 import time
@@ -19,28 +18,19 @@ import openai
 st.set_page_config(page_title="AI Overview/AI Mode query fan-out gap analysis", layout="wide")
 st.title("🔍 AI Overview/AI Mode query fan-out gap analysis")
 
-st.sidebar.header("Settings")
-
-# --- AMENDED: Added UI control for recursion ---
-use_recursion = st.sidebar.checkbox(
-    "Use deep recursive fan-out",
-    value=False,
-    help="Slower but more comprehensive. Fans out from the H1, then fans out again from each of those results. WARNING: Uses many more API calls and may hit rate limits."
-)
-
-st.sidebar.header("About the tool")
+st.sidebar.header("About the query fan-out gap analysis tool")
 st.sidebar.write(
-    """This tool identifies where gaps exist in your content by:
+    """This identify where gaps exist in your content:
 1. Extracting your page's H1 and subheadings (H2–H4).
 2. Using Google Gemini to generate diverse user query fan-outs.
-3. Comparing those queries against content headings to identify missing topics."""
+3. Comparing those queries against content headings to identify concise missing topics."""
 )
 
-# --- Settings ---
+# Fixed settings (no user adjustment)
 gemini_temp = 0.4  # fan-out diversity
 gpt_temp = 0.1     # gap reasoning temperature
-attempts = 2       # number of Gemini aggregation calls for the main H1
-candidate_count = 5# number of candidates per Gemini call
+attempts = 1       # number of Gemini aggregation calls
+candidate_count = 7  # number of candidates per Gemini call
 
 # Load credentials from secrets
 openai.api_key = st.secrets["openai"]["api_key"]
@@ -96,7 +86,7 @@ start_clicked = st.button("Start Audit")
 if start_clicked:
     st.session_state.processed = False
 
-# --- Helper Functions ---
+# Helpers for query normalization & dedupe
 STOPWORDS = {
     "the", "and", "of", "in", "to", "a", "for", "with", "on", "about",
     "vs", "vs.", "is", "are", "your", "what", "how", "why", "more",
@@ -133,21 +123,17 @@ def dedupe_queries(queries, raw_threshold=0.9, residual_threshold=0, embedding_m
         return []
     try:
         resp = openai.embeddings.create(model=embedding_model, input=queries)
-        query_vecs = [np.array(d.embedding, dtype=float) for d in resp.data]
-    except Exception as e:
-        st.error(f"Failed to get embeddings for deduplication: {e}")
+        query_vecs = [np.array(d["embedding"], dtype=float) for d in resp["data"]]
+    except Exception:
         return queries
-
     kept = []
     removed = set()
     anchor_cache = {}
-
     for i, qi in enumerate(queries):
         if i in removed:
             continue
         kept.append(qi)
         vi = query_vecs[i]
-
         for j in range(i + 1, len(queries)):
             if j in removed:
                 continue
@@ -155,17 +141,15 @@ def dedupe_queries(queries, raw_threshold=0.9, residual_threshold=0, embedding_m
             raw_sim = cosine(vi, vj)
             if raw_sim < raw_threshold:
                 continue
-
             shared = set(content_words(qi)) & set(content_words(queries[j]))
             if shared:
                 anchor_text = " ".join(sorted(shared))
                 if anchor_text not in anchor_cache:
                     try:
                         a_resp = openai.embeddings.create(model=embedding_model, input=[anchor_text])
-                        anchor_cache[anchor_text] = np.array(a_resp.data[0].embedding, dtype=float)
+                        anchor_cache[anchor_text] = np.array(a_resp["data"][0]["embedding"], dtype=float)
                     except Exception:
                         anchor_cache[anchor_text] = None
-                
                 anchor_vec = anchor_cache.get(anchor_text)
                 if anchor_vec is not None:
                     ri = remove_component(vi, anchor_vec)
@@ -175,74 +159,42 @@ def dedupe_queries(queries, raw_threshold=0.9, residual_threshold=0, embedding_m
                     residual_sim = raw_sim
             else:
                 residual_sim = raw_sim
-
             if residual_sim >= residual_threshold:
                 removed.add(j)
     return kept
 
-# --- CORRECTED: Helper for a single fan-out call ---
-def _fetch_single_fan_out(text_to_fan_out: str, temp: float) -> list:
-    """Makes a single call to the Gemini API to get fan-out queries for a given text."""
-    queries = []
-    endpoint = (
-        f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"gemini-2.5-flash-latest:generateContent?key={gemini_api_key}"
-    )
-    payload = {
-        "contents": [{"parts": [{"text": text_to_fan_out}]}],
-        "tools": [{"Google Search": {}}],
-        "generationConfig": {
-            "temperature": temp,
-            "candidateCount": candidate_count
-        },
-    }
-    try:
-        r = requests.post(endpoint, json=payload, timeout=45)
-        r.raise_for_status() # Will raise an error for 4xx/5xx status codes
-        for cand in r.json().get("candidates", []):
-            fanouts = cand.get("groundingMetadata", {}).get("webSearchQueries", [])
-            queries.extend(fanouts)
-    except Exception as e:
-        # --- AMENDED: Show a warning instead of failing silently ---
-        st.warning(f"A sub-query fan-out call failed (likely rate-limited): {e}")
-    
-    # --- AMENDED: Increased sleep time to respect API rate limits ---
-    time.sleep(4.1)
-    return list(set(queries)) # Return unique queries from this call
-
-# --- Rewritten function for iterative fan-out ---
-def fetch_query_fan_outs_multi(h1_text: str, attempts: int, temp: float, use_deep_fanout: bool) -> list:
-    """
-    Generates fan-out queries. If use_deep_fanout is True, performs a second level of fan-outs
-    on the initial results.
-    """
-    st.info(f"Performing fan-out for H1: '{h1_text}'")
-    
-    # Step 1: Initial Fan-Out from H1
-    initial_queries = []
-    for _ in range(attempts):
-        initial_queries.extend(_fetch_single_fan_out(h1_text, temp))
-    initial_queries = list(set(initial_queries))
-
-    all_queries = list(initial_queries)
-
-    # Step 2: Recursive Fan-Out (if enabled)
-    if use_deep_fanout and initial_queries:
-        st.info(f"Performing deep fan-out for {len(initial_queries)} sub-queries...")
-        with st.spinner("This may take several minutes..."):
-            for i, query in enumerate(initial_queries):
-                st.write(f"Level 2 Fan-out ({i+1}/{len(initial_queries)}): '{query}'")
-                recursive_queries = _fetch_single_fan_out(query, temp=temp)
-                all_queries.extend(recursive_queries)
-
-    # Step 3: Final Comprehensive Deduplication
+def fetch_query_fan_outs_multi(h1_text, attempts=3, temp=0.0):
+    aggregated = []
+    for attempt_i in range(attempts):
+        endpoint = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"gemini-2.5-flash:generateContent?key={gemini_api_key}"
+        )
+        payload = {
+            "contents": [{"parts": [{"text": h1_text}]}],
+            "tools": [{"Google Search": {}}],
+            "generationConfig": {
+                "temperature": temp,
+                "candidateCount": candidate_count
+            },
+        }
+        try:
+            r = requests.post(endpoint, json=payload, timeout=30)
+            r.raise_for_status()
+            for cand in r.json().get("candidates", []):
+                fanouts = cand.get("groundingMetadata", {}).get("webSearchQueries", [])
+                aggregated.extend(fanouts)
+        except Exception as e:
+            st.warning(f"Fan-out fetch attempt {attempt_i+1} failed: {e}")
+        time.sleep(0.2)
+    # exact dedupe
     seen = set()
     unique_raw = []
-    for q in all_queries:
+    for q in aggregated:
         if q not in seen:
             seen.add(q)
             unique_raw.append(q)
-    
+    # canonical dedupe
     seen_canon = set()
     filtered = []
     for q in unique_raw:
@@ -250,16 +202,8 @@ def fetch_query_fan_outs_multi(h1_text: str, attempts: int, temp: float, use_dee
         if canon not in seen_canon:
             seen_canon.add(canon)
             filtered.append(q)
-            
-    if len(filtered) > 0:
-        st.info(f"Found {len(filtered)} unique queries. Now running semantic deduplication...")
-        final_queries = dedupe_queries(filtered)
-        st.success(f"Deduplication complete. Final unique query count: {len(final_queries)}")
-    else:
-        final_queries = []
-        
-    return final_queries
-
+    # semantic dedupe
+    return dedupe_queries(filtered)
 
 def get_explanations(prompt, temperature=0.1, max_retries=2):
     system_msg = (
@@ -275,42 +219,48 @@ def get_explanations(prompt, temperature=0.1, max_retries=2):
     for attempt in range(1, max_retries + 1):
         try:
             resp = openai.chat.completions.create(
-                model="gpt-4o", 
-                messages=messages, 
-                temperature=temperature, 
-                max_tokens=2000,
-                response_format={"type": "json_object"}
+                model="gpt-4o", messages=messages, temperature=temperature, max_tokens=1000
             )
-            content = resp.choices[0].message.content
-            parsed_json = json.loads(content)
-            
-            for key, value in parsed_json.items():
-                if isinstance(value, list):
-                    return value
-
-            if isinstance(parsed_json, list):
-                return parsed_json
-
-        except (json.JSONDecodeError, AttributeError, KeyError) as e:
-            last_raw = f"JSON parse error: {e}\nRaw output: {content if 'content' in locals() else 'N/A'}"
+            choice = resp.choices[0]
+            text = (
+                choice.message.content.strip()
+                if hasattr(choice, "message")
+                else choice.text.strip()
+            )
+            last_raw = text
+            cleaned = re.sub(r"^```(?:json)?\s*", "", text.strip())
+            cleaned = re.sub(r"\s*```$", "", cleaned)
+            try:
+                parsed = json.loads(cleaned)
+                if isinstance(parsed, list):
+                    return parsed
+            except json.JSONDecodeError:
+                pass
+            m = re.search(r"\[.*\]", text, flags=re.DOTALL)
+            if m:
+                try:
+                    parsed = json.loads(m.group(0))
+                    if isinstance(parsed, list):
+                        return parsed
+                except json.JSONDecodeError:
+                    pass
+            if attempt < max_retries:
+                messages.append({"role": "assistant", "content": text})
+                messages.append({
+                    "role": "user", "content": (
+                        "Previous response was not valid JSON. Please output only the JSON array exactly as specified. "
+                        "Example: [{\"query\":\"...\",\"covered\":true,\"explanation\":\"...\"}]"
+                    ),
+                })
         except Exception as e:
             last_raw = f"API error: {e}"
-        
-        if attempt < max_retries:
-            messages.append({"role": "assistant", "content": content if 'content' in locals() else last_raw})
-            messages.append({
-                "role": "user", "content": (
-                    "Your previous response was not a valid JSON object containing an array. Please try again. "
-                    "Ensure the output is a single JSON object, with a key whose value is the array of results. "
-                    "For example: {\"results\": [{\"query\":\"...\",\"covered\":true,\"explanation\":\"...\"}]}"
-                ),
-            })
-            time.sleep(1 * attempt)
-
+            if attempt < max_retries:
+                time.sleep(1 * attempt)
+                continue
     st.warning(f"OpenAI parse failure after {max_retries} attempts. Raw output:\n{last_raw}")
     return []
 
-# --- Main audit loop ---
+# Main audit loop (only runs when user clicks)
 if start_clicked and urls and not st.session_state.processed:
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -326,32 +276,28 @@ if start_clicked and urls and not st.session_state.processed:
             with sync_playwright() as p:
                 browser = p.chromium.launch(headless=True)
                 page = browser.new_page()
-                page.goto(url, timeout=60000, wait_until="domcontentloaded")
-                
-                page_title = page.title().lower()
-                if "403 forbidden" in page_title or "access denied" in page_title:
-                     browser.close()
-                     return "", [], "HTTP 403 Forbidden (Playwright)"
-
+                resp = page.goto(url, timeout=60000)
+                if resp and resp.status == 403:
+                    return "", [], "HTTP 403 Forbidden (Playwright)"
                 html = page.content()
                 browser.close()
             soup = BeautifulSoup(html, "html.parser")
-        except Exception as e:
+        except Exception:
             try:
-                scraper = cloudscraper.create_scraper()
+                scraper = cloudscraper.create_scraper(
+                    browser={"browser": "chrome", "platform": "windows", "mobile": False}
+                )
                 r = scraper.get(url, timeout=30)
-                r.raise_for_status()
+                try:
+                    r.raise_for_status()
+                except requests.exceptions.HTTPError as he:
+                    code = he.response.status_code if he.response else "unknown"
+                    reason = he.response.reason if he.response and hasattr(he.response, "reason") else ""
+                    return "", [], f"HTTP {code} {reason} (fallback)"
                 soup = BeautifulSoup(r.text, "html.parser")
-            except requests.exceptions.HTTPError as he:
-                code = he.response.status_code if he.response else "unknown"
-                return "", [], f"HTTP {code} Error (Fallback)"
-            except Exception as final_e:
-                return "", [], f"Fetch failed: {final_e}"
-        
+            except Exception:
+                return "", [], "Fetch failed (both Playwright and fallback)"
         h1 = soup.find("h1").get_text(strip=True) if soup.find("h1") else ""
-        if not h1:
-            h1 = soup.find("title").get_text(strip=True) if soup.find("title") else ""
-            
         headings = [(tag.name.upper(), tag.get_text(strip=True)) for tag in soup.find_all(["h2", "h3", "h4"])]
         return h1, headings, None
 
@@ -364,115 +310,119 @@ if start_clicked and urls and not st.session_state.processed:
         ]
         for lvl, txt in headings:
             lines.append(f"{lvl}: {txt}")
-        lines.extend(["", "2) User queries to check for coverage:"])
+        lines.extend(["", "2) User queries to cover:"])
         for q in queries:
             lines.append(f"- {q}")
         lines.extend([
-            "", "3) Return a JSON object where a single key contains an array of objects. Each object must have keys: query, covered, explanation.",
-            'Example: {"results": [{"query":"...","covered":true,"explanation":"..."}]}',
+            "", "3) Return JSON array of objects with keys: query, covered, explanation.",
+            'Example: [{"query":"...","covered":true,"explanation":"..."}]',
         ])
         return "\n".join(lines)
 
     for idx, url in enumerate(urls):
         elapsed = time.time() - start_time
-        avg_time_per_url = elapsed / (idx + 1) if idx > 0 else elapsed
-        remaining_urls = total - (idx + 1)
-        eta_secs = remaining_urls * avg_time_per_url
-        eta_str = time.strftime("%M:%S", time.gmtime(eta_secs))
-        progress_bar.progress((idx + 1) / total)
-        status_text.text(f"Processing {idx+1}/{total} ({url}). ETA: {eta_str}")
+        avg = elapsed / (idx + 1)
+        remaining = total - (idx + 1)
+        eta_secs = remaining * avg
+        mins = int(eta_secs // 60)
+        secs = int(eta_secs % 60)
+        eta_str = f"{mins}m {secs}s" if mins > 0 else f"{secs}s"
+        progress_bar.progress(int((idx + 1) / total * 100))
+        status_text.text(f"Processing {idx+1}/{total}. ETA: {eta_str}")
 
         h1, headings, err = extract_h1_and_headings(url)
         if err:
-            st.warning(f"⚠️ Skipped {url}: {err}.")
-            st.session_state.skipped.append({"Address": url, "Reason": err})
+            if "403" in err:
+                st.error(
+                    f"❌ Could not access {url}: {err}. Possible reasons: site is behind Cloudflare/WAF, IP blocked, rate-limited, or requires JS/auth."
+                )
+                st.session_state.skipped.append(
+                    {"Address": url, "Reason": f"{err} (likely blocked/forbidden)"}
+                )
+            else:
+                st.warning(f"⚠️ Skipped {url}: {err}.")
+                st.session_state.skipped.append({"Address": url, "Reason": err})
             continue
-
-        if not h1:
-            st.warning(f"Skipped {url}: no H1 or Title found.")
-            st.session_state.skipped.append({"Address": url, "Reason": "No H1 or Title tag found"})
+        if not h1 and not headings:
+            st.warning(f"Skipped {url}: no H1 or subheadings found.")
+            st.session_state.skipped.append({"Address": url, "Reason": "No H1 or subheadings found"})
             continue
-        
-        cache_key = f"{h1}_{use_recursion}"
-        if cache_key in st.session_state.h1_fanout_cache:
-            fanouts = st.session_state.h1_fanout_cache[cache_key]
-            st.info(f"Using cached fan-out queries for H1: '{h1}'")
+        if h1 in st.session_state.h1_fanout_cache:
+            fanouts = st.session_state.h1_fanout_cache[h1]
         else:
-            fanouts = fetch_query_fan_outs_multi(h1, attempts=attempts, temp=gemini_temp, use_deep_fanout=use_recursion)
-            st.session_state.h1_fanout_cache[cache_key] = fanouts
-        
+            fanouts = fetch_query_fan_outs_multi(h1, attempts=attempts, temp=gemini_temp)
+            st.session_state.h1_fanout_cache[h1] = fanouts
         if not fanouts:
-            st.warning(f"Skipped {url}: no fan-out queries were generated for H1 '{h1}'. Check for API rate-limit warnings above.")
-            st.session_state.skipped.append({"Address": url, "Reason": f"No fan-out queries for H1: '{h1}'"})
+            st.warning(f"Skipped {url}: no fan-out queries for H1 '{h1}'.")
+            st.session_state.skipped.append(
+                {"Address": url, "Reason": f"No fan-out queries returned for H1: '{h1}'"}
+            )
             continue
-
         prompt = build_prompt(h1, headings, fanouts)
         results = get_explanations(prompt, temperature=gpt_temp)
-        
         if not results:
             st.warning(f"Skipped {url}: OpenAI returned no usable output.")
-            st.session_state.skipped.append({"Address": url, "Reason": "OpenAI parsing failed"})
+            st.session_state.skipped.append(
+                {"Address": url, "Reason": "OpenAI returned no results or parsing failed"}
+            )
             continue
-
-        covered_count = sum(1 for it in results if it.get("covered"))
-        coverage_pct = round((covered_count / len(results)) * 100) if results else 0
-        
-        st.session_state.summary.append({
-            "Address": url, "Fan-out Count": len(fanouts), "Coverage (%)": coverage_pct
-        })
-        
-        missing_queries = [it.get("query") for it in results if not it.get("covered")]
-        st.session_state.actions.append({
-            "Address": url, "Recommended Sections to Add to Content": "; ".join(missing_queries)
-        })
-
-        detailed_row = {
+        covered = sum(1 for it in results if it.get("covered"))
+        pct = round((covered / len(results)) * 100) if results else 0
+        st.session_state.summary.append(
+            {"Address": url, "Fan-out Count": len(fanouts), "Coverage (%)": pct}
+        )
+        missing = [it.get("query") for it in results if not it.get("covered")]
+        st.session_state.actions.append(
+            {"Address": url, "Recommended Sections to Add to Content": "; ".join(missing)}
+        )
+        row = {
             "Address": url,
             "H1-1": h1,
             "Content Structure": " | ".join(f"{lvl}:{txt}" for lvl, txt in headings),
         }
         for i, it in enumerate(results):
-            detailed_row[f"Query {i+1}"] = it.get("query", "")
-            detailed_row[f"Query {i+1} Covered"] = "Yes" if it.get("covered") else "No"
-            detailed_row[f"Query {i+1} Explanation"] = it.get("explanation", "")
-        st.session_state.detailed.append(detailed_row)
-
-    progress_bar.progress(1.0)
-    status_text.text("Audit Complete!")
+            row[f"Query {i+1}"] = it.get("query", "")
+            row[f"Query {i+1} Covered"] = "Yes" if it.get("covered") else "No"
+            row[f"Query {i+1} Explanation"] = it.get("explanation", "")
+        st.session_state.detailed.append(row)
+    progress_bar.progress(100)
+    status_text.text("Complete!")
     st.session_state.processed = True
 
-# --- Display / download final outputs ---
+# Display / download final outputs
 if st.session_state.processed:
     st.header("Results")
+
+    if st.session_state.detailed:
+        st.subheader("Detailed")
+        df_det = pd.DataFrame(st.session_state.detailed)
+        st.download_button(
+            "Download Detailed CSV", df_det.to_csv(index=False).encode("utf-8"), "detailed.csv", "text/csv"
+        )
+        st.dataframe(df_det)
 
     if st.session_state.summary:
         st.subheader("Summary")
         df_sum = pd.DataFrame(st.session_state.summary)
+        base_cols = ["Address", "Fan-out Count", "Coverage (%)"]
+        ordered = [c for c in base_cols if c in df_sum.columns] + [c for c in df_sum.columns if c not in base_cols]
+        df_sum = df_sum[ordered]
         st.download_button(
-            "Download Summary CSV", df_sum.to_csv(index=False).encode("utf-8"), "summary.csv", "text/csv", key="sum_dl"
+            "Download Summary CSV", df_sum.to_csv(index=False).encode("utf-8"), "summary.csv", "text/csv"
         )
         st.dataframe(df_sum)
-    
+
     if st.session_state.actions:
         st.subheader("Actions")
         df_act = pd.DataFrame(st.session_state.actions)
         st.download_button(
-            "Download Actions CSV", df_act.to_csv(index=False).encode("utf-8"), "actions.csv", "text/csv", key="act_dl"
+            "Download Actions CSV", df_act.to_csv(index=False).encode("utf-8"), "actions.csv", "text/csv"
         )
         st.dataframe(df_act)
-        
-    if st.session_state.detailed:
-        st.subheader("Detailed Breakdown")
-        df_det = pd.DataFrame(st.session_state.detailed)
-        st.download_button(
-            "Download Detailed CSV", df_det.to_csv(index=False).encode("utf-8"), "detailed.csv", "text/csv", key="det_dl"
-        )
-        st.dataframe(df_det)
 
     if st.session_state.skipped:
         st.subheader("Skipped URLs and Reasons")
         st.table(pd.DataFrame(st.session_state.skipped))
-
 
 
 
