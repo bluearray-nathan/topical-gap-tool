@@ -105,8 +105,7 @@ def fetch_query_fan_outs_multi(text, attempts=1, temp=0.0):
         try:
             response = requests.post(endpoint, json=payload, timeout=60)
             response.raise_for_status()
-            candidates = response.json().get("candidates", [])
-            for cand in candidates:
+            for cand in response.json().get("candidates", []):
                 queries.extend(
                     cand.get("groundingMetadata", {}).get("webSearchQueries", []) or []
                 )
@@ -123,14 +122,16 @@ def extract_content(url):
             resp = page.goto(url, timeout=60000)
             if resp and resp.status == 403:
                 return "", [], "", "HTTP 403 Forbidden"
-            html = page.content(); browser.close()
+            html = page.content()
+            browser.close()
         soup = BeautifulSoup(html, "html.parser")
     except Exception:
         try:
             scraper = cloudscraper.create_scraper(
                 browser={"browser":"chrome","platform":"windows","mobile":False}
             )
-            r = scraper.get(url, timeout=60); r.raise_for_status()
+            r = scraper.get(url, timeout=60)
+            r.raise_for_status()
             soup = BeautifulSoup(r.text, "html.parser")
         except Exception:
             return "", [], "", "Fetch error"
@@ -146,7 +147,6 @@ def extract_content(url):
 
 # --- Helper: Build the OpenAI Prompt with Full Content ---
 def build_prompt(h1, headings, body, queries):
-    # Build prompt including instruction to evaluate every query explicitly
     lines = [
         "I’m auditing this page for content gaps.",
         f"Main topic (H1): {h1}",
@@ -155,11 +155,9 @@ def build_prompt(h1, headings, body, queries):
     ]
     for lvl, txt in headings:
         lines.append(f"- {lvl}: {txt}")
-    lines += ["", "Page Body Text:", body[:2000],  # limit to first 2000 chars
-              "", "Queries to check coverage:"]
+    lines += ["", "Page Body Text:", body[:2000], "", "Queries to check coverage:"]
     for q in queries:
         lines.append(f"- {q}")
-    # Force inclusion of all queries in output
     lines += [
         "", 
         "Please provide coverage entries for *all* of the above queries, even if covered=false.",
@@ -168,18 +166,21 @@ def build_prompt(h1, headings, body, queries):
         "query (string), covered (true/false), explanation (string).",
         "Example: [{\"query\":\"...\",\"covered\":true,\"explanation\":\"...\"}]"
     ]
-    # Correct newline join syntax
-    return "
-".join(lines)
+    return "\n".join(lines)
 
 # --- Helper: Call OpenAI for Coverage Analysis ---
 def get_explanations(prompt, temperature=0.1, max_retries=2):
     system_msg = "You are an SEO content gap auditor. Output ONLY a JSON array."
-    messages = [{"role":"system","content":system_msg}, {"role":"user","content":prompt}]
+    messages = [
+        {"role": "system", "content": system_msg},
+        {"role": "user", "content": prompt},
+    ]
     last_resp = ""
-    for attempt in range(max_retries):
+    for _ in range(max_retries):
         try:
-            resp = openai.chat.completions.create(model="gpt-4o", messages=messages, temperature=temperature)
+            resp = openai.chat.completions.create(
+                model="gpt-4o", messages=messages, temperature=temperature
+            )
             text = resp.choices[0].message.content.strip()
             last_resp = text
             match = re.search(r"\[.*\]", text, flags=re.DOTALL)
@@ -196,6 +197,7 @@ if st.button("Start Audit") and urls and not st.session_state.processed:
     status_text = st.empty()
     start_time = time.time()
 
+    # Clear previous results
     st.session_state.detailed.clear()
     st.session_state.summary.clear()
     st.session_state.actions.clear()
@@ -211,7 +213,7 @@ if st.button("Start Audit") and urls and not st.session_state.processed:
         if err or not h1_text:
             reason = err or "No H1 found"
             st.warning(f"Skipped {url}: {reason}")
-            st.session_state.skipped.append({"Address":url,"Reason":reason})
+            st.session_state.skipped.append({"Address": url, "Reason": reason})
             continue
 
         # Level 1 fan-out
@@ -228,32 +230,37 @@ if st.button("Start Audit") and urls and not st.session_state.processed:
 
         if not all_qs:
             st.warning(f"Skipped {url}: no queries generated.")
-            st.session_state.skipped.append({"Address":url,"Reason":"No queries"})
+            st.session_state.skipped.append({"Address": url, "Reason": "No queries generated"})
             continue
 
         prompt = build_prompt(h1_text, headings, body, all_qs)
         results = get_explanations(prompt, temperature=gpt_temp)
         if not results:
             st.warning(f"Skipped {url}: OpenAI returned no usable output.")
-            st.session_state.skipped.append({"Address":url,"Reason":"No usable output"})
+            st.session_state.skipped.append({"Address": url, "Reason": "No usable output from OpenAI"})
             continue
 
         covered = sum(1 for r in results if r.get("covered"))
-        pct = int((covered/len(results)) * 100)
-        st.session_state.summary.append({"Address":url,"Fan-out Count":len(all_qs),"Coverage (%)":pct})
-        missing = [r.get("query") for r in results if not r.get("covered")]  
-        st.session_state.actions.append({"Address":url,"Recommended Sections to Add":"; ".join(missing)})
+        pct = int((covered / len(results)) * 100)
+        st.session_state.summary.append({"Address": url, "Fan-out Count": len(all_qs), "Coverage (%)": pct})
+        missing = [r.get("query") for r in results if not r.get("covered")]
+        st.session_state.actions.append({"Address": url, "Recommended Sections to Add": "; ".join(missing)})
 
-        row = {"Address":url,"H1":h1_text,"Headings":" | ".join(f"{l}
-        # Include full list of fan-out queries for verification
-        row["All Queries"] = "; ".join(all_qs):{t}" for l,t in headings)}
+        row = {
+            "Address": url,
+            "H1": h1_text,
+            "Headings": " | ".join(f"{l}:{t}" for l, t in headings),
+            "All Queries": "; ".join(all_qs)
+        }
         for i, r in enumerate(results, start=1):
-            row[f"Query {i}"]=r.get("query"); row[f"Covered {i}"]=r.get("covered"); row[f"Explanation {i}"]=r.get("explanation")
+            row[f"Query {i}"]       = r.get("query")
+            row[f"Covered {i}"]     = r.get("covered")
+            row[f"Explanation {i}"] = r.get("explanation")
         st.session_state.detailed.append(row)
 
     progress_bar.progress(100)
     status_text.text("Audit Complete!")
-    st.session_state.processed=True
+    st.session_state.processed = True
 
 # --- Display / Download Results ---
 if st.session_state.processed:
@@ -261,21 +268,22 @@ if st.session_state.processed:
     if st.session_state.detailed:
         st.subheader("Detailed")
         df = pd.DataFrame(st.session_state.detailed)
-        st.download_button("Download Detailed CSV", df.to_csv(index=False).encode(), "detailed.csv")
+        st.download_button("Download Detailed CSV", df.to_csv(index=False).encode("utf-8"), "detailed.csv")
         st.dataframe(df)
     if st.session_state.summary:
         st.subheader("Summary")
         df = pd.DataFrame(st.session_state.summary)
-        st.download_button("Download Summary CSV", df.to_csv(index=False).encode(), "summary.csv")
+        st.download_button("Download Summary CSV", df.to_csv(index=False).encode("utf-8"), "summary.csv")
         st.dataframe(df)
     if st.session_state.actions:
         st.subheader("Actions")
         df = pd.DataFrame(st.session_state.actions)
-        st.download_button("Download Actions CSV", df.to_csv(index=False).encode(), "actions.csv")
+        st.download_button("Download Actions CSV", df.to_csv(index=False).encode("utf-8"), "actions.csv")
         st.dataframe(df)
     if st.session_state.skipped:
         st.subheader("Skipped URLs & Reasons")
         st.table(pd.DataFrame(st.session_state.skipped))
+
 
 
 
