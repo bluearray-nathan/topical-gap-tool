@@ -22,18 +22,18 @@ st.sidebar.header("About this tool")
 st.sidebar.write(
     """
 This tool identifies content gaps by:
-1. Extracting your page's H1 headings.
+1. Extracting your page's H1 headings and body text.
 2. Generating user query fan-outs for each H1 query using Google Gemini.
 3. Performing a second-level fan-out on those queries to maximize coverage.
-4. Comparing all generated queries against the page's headings to highlight missing topics.
+4. Comparing all generated queries against the page's full content to highlight missing topics.
 """
 )
 
 # --- Fixed Configuration ---
 gemini_temp = 0.4      # Diversity for fan-out generation
-gpt_temp = 0.1         # Temperature for gap reasoning
-attempts = 1           # Number of Gemini aggregation calls
-candidate_count = 5    # Number of candidates per Gemini call
+gpt_temp    = 0.1      # Temperature for gap reasoning
+attempts    = 1        # Number of Gemini aggregation calls
+candidate_count = 7    # Number of candidates per call
 
 # --- Load API Keys from Streamlit Secrets ---
 openai.api_key = st.secrets["openai"]["api_key"]
@@ -114,75 +114,66 @@ def fetch_query_fan_outs_multi(text, attempts=1, temp=0.0):
             st.warning(f"Fan-out fetch failed for '{text}': {e}")
     return queries
 
-# --- Helper: Extract H1 and Subheadings ---
-def extract_h1_and_headings(url):
+# --- Helper: Extract H1, Headings, and Body Text ---
+def extract_content(url):
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             page = browser.new_page()
             resp = page.goto(url, timeout=60000)
             if resp and resp.status == 403:
-                return "", [], "HTTP 403 Forbidden"
-            html = page.content()
-            browser.close()
+                return "", [], "", "HTTP 403 Forbidden"
+            html = page.content(); browser.close()
         soup = BeautifulSoup(html, "html.parser")
     except Exception:
         try:
             scraper = cloudscraper.create_scraper(
-                browser={"browser": "chrome", "platform": "windows", "mobile": False}
+                browser={"browser":"chrome","platform":"windows","mobile":False}
             )
-            r = scraper.get(url, timeout=30)
-            r.raise_for_status()
+            r = scraper.get(url, timeout=60); r.raise_for_status()
             soup = BeautifulSoup(r.text, "html.parser")
         except Exception:
-            return "", [], "Fetch error"
-    h1 = soup.find("h1")
-    h1_text = h1.get_text(strip=True) if h1 else ""
-    headings = [
-        (tag.name.upper(), tag.get_text(strip=True)) for tag in soup.find_all(["h2","h3","h4"])
-    ]
-    return h1_text, headings, None
+            return "", [], "", "Fetch error"
+    # H1 and subheadings
+    h1_tag = soup.find("h1")
+    h1_text = h1_tag.get_text(strip=True) if h1_tag else ""
+    headings = [(tag.name.upper(), tag.get_text(strip=True)) for tag in soup.find_all(["h2","h3","h4"])]
+    # Body text: paragraphs and list items
+    paragraphs = [p.get_text(strip=True) for p in soup.find_all("p")]
+    list_items = [li.get_text(strip=True) for li in soup.find_all("li")]
+    body = "\n".join(paragraphs + list_items)
+    return h1_text, headings, body, None
 
-# --- Helper: Build the OpenAI Prompt ---
-def build_prompt(h1, headings, queries):
+# --- Helper: Build the OpenAI Prompt with Full Content ---
+def build_prompt(h1, headings, body, queries):
     lines = [
         "I’m auditing this page for content gaps.",
         f"Main topic (H1): {h1}",
-        "",
-        "1) Existing headings (in order):",
+        "", "Existing Headings:",
     ]
     for lvl, txt in headings:
-        lines.append(f"{lvl}: {txt}")
-    lines.append("")
-    lines.append("2) User queries to cover:")
+        lines.append(f"- {lvl}: {txt}")
+    lines += ["", "Page Body Text:", body[:2000],  # limit to first 2000 chars
+              "", "Queries to check coverage:"]
     for q in queries:
         lines.append(f"- {q}")
-    lines.append("")
-    lines.append(
-        "3) Return a JSON array with keys: query (string), covered (true/false), explanation (string)."
-    )
-    lines.append('Example: [{"query":"...","covered":true,"explanation":"..."}]')
+    lines += ["", 
+        "Given the above headings and body text, return ONLY a JSON array with keys:",
+        "query (string), covered (true/false), explanation (string).",
+        "Example: [{\"query\":\"...\",\"covered\":true,\"explanation\":\"...\"}]"
+    ]
     return "\n".join(lines)
 
 # --- Helper: Call OpenAI for Coverage Analysis ---
 def get_explanations(prompt, temperature=0.1, max_retries=2):
-    system_msg = (
-        "You are an SEO content gap auditor. Output ONLY a JSON array. "
-        "Each item must have exactly: query, covered, explanation."
-    )
-    messages = [
-        {"role": "system", "content": system_msg},
-        {"role": "user", "content": prompt},
-    ]
+    system_msg = "You are an SEO content gap auditor. Output ONLY a JSON array."
+    messages = [{"role":"system","content":system_msg}, {"role":"user","content":prompt}]
     last_resp = ""
     for attempt in range(max_retries):
         try:
-            resp = openai.chat.completions.create(
-                model="gpt-4o", messages=messages, temperature=temperature
-            )
+            resp = openai.chat.completions.create(model="gpt-4o", messages=messages, temperature=temperature)
             text = resp.choices[0].message.content.strip()
             last_resp = text
-            # Extract JSON array
             match = re.search(r"\[.*\]", text, flags=re.DOTALL)
             if match:
                 return json.loads(match.group(0))
@@ -204,13 +195,11 @@ if st.button("Start Audit") and urls and not st.session_state.processed:
 
     for idx, url in enumerate(urls, start=1):
         elapsed = time.time() - start_time
-        avg_per = elapsed / idx
-        rem = total - idx
-        eta = int(rem * avg_per)
+        eta = int((elapsed/idx) * (total-idx))
         status_text.text(f"Processing {idx}/{total} — ETA: {eta}s")
         progress_bar.progress(int(idx/total*100))
 
-        h1_text, headings, err = extract_h1_and_headings(url)
+        h1_text, headings, body, err = extract_content(url)
         if err or not h1_text:
             reason = err or "No H1 found"
             st.warning(f"Skipped {url}: {reason}")
@@ -234,7 +223,7 @@ if st.button("Start Audit") and urls and not st.session_state.processed:
             st.session_state.skipped.append({"Address":url,"Reason":"No queries"})
             continue
 
-        prompt = build_prompt(h1_text, headings, all_qs)
+        prompt = build_prompt(h1_text, headings, body, all_qs)
         results = get_explanations(prompt, temperature=gpt_temp)
         if not results:
             st.warning(f"Skipped {url}: OpenAI returned no usable output.")
@@ -242,13 +231,13 @@ if st.button("Start Audit") and urls and not st.session_state.processed:
             continue
 
         covered = sum(1 for r in results if r.get("covered"))
-        pct = int((covered/len(results))*100)
+        pct = int((covered/len(results)) * 100)
         st.session_state.summary.append({"Address":url,"Fan-out Count":len(all_qs),"Coverage (%)":pct})
-        missing = [r.get("query") for r in results if not r.get("covered")]
+        missing = [r.get("query") for r in results if not r.get("covered")]  
         st.session_state.actions.append({"Address":url,"Recommended Sections to Add":"; ".join(missing)})
 
         row = {"Address":url,"H1":h1_text,"Headings":" | ".join(f"{l}:{t}" for l,t in headings)}
-        for i,r in enumerate(results, start=1):
+        for i, r in enumerate(results, start=1):
             row[f"Query {i}"]=r.get("query"); row[f"Covered {i}"]=r.get("covered"); row[f"Explanation {i}"]=r.get("explanation")
         st.session_state.detailed.append(row)
 
@@ -277,6 +266,7 @@ if st.session_state.processed:
     if st.session_state.skipped:
         st.subheader("Skipped URLs & Reasons")
         st.table(pd.DataFrame(st.session_state.skipped))
+
 
 
 
