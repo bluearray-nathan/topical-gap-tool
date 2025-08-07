@@ -186,7 +186,7 @@ def _fetch_single_fan_out(text_to_fan_out: str, temp: float) -> list:
     queries = []
     endpoint = (
         f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"gemini-1.5-flash-latest:generateContent?key={gemini_api_key}"
+        f"gemini-2.5-flash-latest:generateContent?key={gemini_api_key}"
     )
     payload = {
         "contents": [{"parts": [{"text": text_to_fan_out}]}],
