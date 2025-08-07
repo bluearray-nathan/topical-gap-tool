@@ -146,6 +146,7 @@ def extract_content(url):
 
 # --- Helper: Build the OpenAI Prompt with Full Content ---
 def build_prompt(h1, headings, body, queries):
+    # Build prompt including instruction to evaluate every query explicitly
     lines = [
         "I’m auditing this page for content gaps.",
         f"Main topic (H1): {h1}",
@@ -157,12 +158,17 @@ def build_prompt(h1, headings, body, queries):
               "", "Queries to check coverage:"]
     for q in queries:
         lines.append(f"- {q}")
-    lines += ["", 
+    # Force inclusion of all queries in output
+    lines += [
+        "", 
+        "Please provide coverage entries for *all* of the above queries, even if covered=false.",
+        "", 
         "Given the above headings and body text, return ONLY a JSON array with keys:",
         "query (string), covered (true/false), explanation (string).",
         "Example: [{\"query\":\"...\",\"covered\":true,\"explanation\":\"...\"}]"
     ]
-    return "\n".join(lines)
+    return "
+".join(lines)
 
 # --- Helper: Call OpenAI for Coverage Analysis ---
 def get_explanations(prompt, temperature=0.1, max_retries=2):
@@ -236,7 +242,9 @@ if st.button("Start Audit") and urls and not st.session_state.processed:
         missing = [r.get("query") for r in results if not r.get("covered")]  
         st.session_state.actions.append({"Address":url,"Recommended Sections to Add":"; ".join(missing)})
 
-        row = {"Address":url,"H1":h1_text,"Headings":" | ".join(f"{l}:{t}" for l,t in headings)}
+        row = {"Address":url,"H1":h1_text,"Headings":" | ".join(f"{l}
+        # Include full list of fan-out queries for verification
+        row["All Queries"] = "; ".join(all_qs):{t}" for l,t in headings)}
         for i, r in enumerate(results, start=1):
             row[f"Query {i}"]=r.get("query"); row[f"Covered {i}"]=r.get("covered"); row[f"Explanation {i}"]=r.get("explanation")
         st.session_state.detailed.append(row)
@@ -266,6 +274,7 @@ if st.session_state.processed:
     if st.session_state.skipped:
         st.subheader("Skipped URLs & Reasons")
         st.table(pd.DataFrame(st.session_state.skipped))
+
 
 
 
