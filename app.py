@@ -150,7 +150,8 @@ def build_prompt(h1, headings, body, queries):
     lines = [
         "I’m auditing this page for content gaps.",
         f"Main topic (H1): {h1}",
-        "", "Existing Headings:",
+        "",
+        "Existing Headings:",
     ]
     for lvl, txt in headings:
         lines.append(f"- {lvl}: {txt}")
@@ -167,6 +168,7 @@ def build_prompt(h1, headings, body, queries):
         "query (string), covered (true/false), explanation (string).",
         "Example: [{\"query\":\"...\",\"covered\":true,\"explanation\":\"...\"}]"
     ]
+    # Correct newline join syntax
     return "
 ".join(lines)
 
@@ -274,6 +276,7 @@ if st.session_state.processed:
     if st.session_state.skipped:
         st.subheader("Skipped URLs & Reasons")
         st.table(pd.DataFrame(st.session_state.skipped))
+
 
 
 
