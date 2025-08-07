@@ -33,7 +33,7 @@ This tool identifies content gaps by:
 gemini_temp = 0.4      # Diversity for fan-out generation
 gpt_temp = 0.1         # Temperature for gap reasoning
 attempts = 1           # Number of Gemini aggregation calls
-candidate_count = 7    # Number of candidates per Gemini call
+candidate_count = 5    # Number of candidates per Gemini call
 
 # --- Load API Keys from Streamlit Secrets ---
 openai.api_key = st.secrets["openai"]["api_key"]
