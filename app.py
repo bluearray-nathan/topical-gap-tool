@@ -178,7 +178,7 @@ def dedupe_queries(queries, raw_threshold=0.9, residual_threshold=0, embedding_m
                 removed.add(j)
     return kept
 
-# --- AMENDED: New helper for a single fan-out call ---
+# --- CORRECTED: Helper for a single fan-out call ---
 def _fetch_single_fan_out(text_to_fan_out: str, single_attempt_count: int, temp: float) -> list:
     """Makes a single call to the Gemini API to get fan-out queries for a given text."""
     queries = []
@@ -201,14 +201,17 @@ def _fetch_single_fan_out(text_to_fan_out: str, single_attempt_count: int, temp:
         for cand in r.json().get("candidates", []):
             fanouts = cand.get("groundingMetadata", {}).get("webSearchQueries", [])
             queries.extend(fanouts)
+    # THIS IS THE CORRECTED BLOCK
     except Exception as e:
-    # Temporarily expose the error for debugging
-    st.error(f"A fan-out API call failed: {e}")
-    st.error(f"Payload sent: {json.dumps(payload, indent=2)}") # Also show what was sent
+        # Temporarily expose the error for debugging
+        st.error(f"A fan-out API call failed: {e}")
+        st.error(f"Payload sent: {json.dumps(payload, indent=2)}")
+    # END OF CORRECTION
+    
     time.sleep(0.5) # API rate limiting
     return list(set(queries)) # Return unique queries from this call
 
-# --- AMENDED: Rewritten function for iterative fan-out ---
+# --- Rewritten function for iterative fan-out ---
 def fetch_query_fan_outs_multi(h1_text: str, attempts: int, temp: float, depth: int) -> list:
     """
     Generates fan-out queries. If depth > 0, performs a second level of fan-outs
@@ -491,7 +494,6 @@ if st.session_state.processed:
     if st.session_state.skipped:
         st.subheader("Skipped URLs and Reasons")
         st.table(pd.DataFrame(st.session_state.skipped))
-
 
 
 
