@@ -19,20 +19,24 @@ import openai
 st.set_page_config(page_title="AI Overview/AI Mode query fan-out gap analysis", layout="wide")
 st.title("🔍 AI Overview/AI Mode query fan-out gap analysis")
 
-st.sidebar.header("About the query fan-out gap analysis tool")
+st.sidebar.header("Settings")
+
+# --- AMENDED: Added UI control for recursion ---
+use_recursion = st.sidebar.checkbox(
+    "Use deep recursive fan-out",
+    value=False,
+    help="Slower but more comprehensive. Fans out from the H1, then fans out again from each of those results. WARNING: Uses many more API calls and may hit rate limits."
+)
+
+st.sidebar.header("About the tool")
 st.sidebar.write(
     """This tool identifies where gaps exist in your content by:
 1. Extracting your page's H1 and subheadings (H2–H4).
-2. Using Google Gemini to generate diverse user query fan-outs (now with an optional recursive step for deeper analysis).
+2. Using Google Gemini to generate diverse user query fan-outs.
 3. Comparing those queries against content headings to identify missing topics."""
 )
 
 # --- Settings ---
-# New setting to control the fan-out method
-# 0 = Original behavior (single fan-out from H1)
-# 1 = Recursive (fan-out from H1, then fan-out from each of those results)
-recursion_depth = 1
-
 gemini_temp = 0.4  # fan-out diversity
 gpt_temp = 0.1     # gap reasoning temperature
 attempts = 2       # number of Gemini aggregation calls for the main H1
@@ -177,7 +181,7 @@ def dedupe_queries(queries, raw_threshold=0.9, residual_threshold=0, embedding_m
     return kept
 
 # --- CORRECTED: Helper for a single fan-out call ---
-def _fetch_single_fan_out(text_to_fan_out: str, single_attempt_count: int, temp: float) -> list:
+def _fetch_single_fan_out(text_to_fan_out: str, temp: float) -> list:
     """Makes a single call to the Gemini API to get fan-out queries for a given text."""
     queries = []
     endpoint = (
@@ -186,7 +190,6 @@ def _fetch_single_fan_out(text_to_fan_out: str, single_attempt_count: int, temp:
     )
     payload = {
         "contents": [{"parts": [{"text": text_to_fan_out}]}],
-        # THIS IS THE CORRECTED LINE
         "tools": [{"Google Search": {}}],
         "generationConfig": {
             "temperature": temp,
@@ -195,48 +198,42 @@ def _fetch_single_fan_out(text_to_fan_out: str, single_attempt_count: int, temp:
     }
     try:
         r = requests.post(endpoint, json=payload, timeout=45)
-        r.raise_for_status()
+        r.raise_for_status() # Will raise an error for 4xx/5xx status codes
         for cand in r.json().get("candidates", []):
             fanouts = cand.get("groundingMetadata", {}).get("webSearchQueries", [])
             queries.extend(fanouts)
     except Exception as e:
-        # Fail silently now that the issue is understood, to keep the UI clean.
-        pass
+        # --- AMENDED: Show a warning instead of failing silently ---
+        st.warning(f"A sub-query fan-out call failed (likely rate-limited): {e}")
     
-    time.sleep(0.5) # API rate limiting
+    # --- AMENDED: Increased sleep time to respect API rate limits ---
+    time.sleep(4.1)
     return list(set(queries)) # Return unique queries from this call
 
 # --- Rewritten function for iterative fan-out ---
-def fetch_query_fan_outs_multi(h1_text: str, attempts: int, temp: float, depth: int) -> list:
+def fetch_query_fan_outs_multi(h1_text: str, attempts: int, temp: float, use_deep_fanout: bool) -> list:
     """
-    Generates fan-out queries. If depth > 0, performs a second level of fan-outs
+    Generates fan-out queries. If use_deep_fanout is True, performs a second level of fan-outs
     on the initial results.
     """
-    st.info(f"Performing fan-out for H1: '{h1_text}' (Recursion Depth: {depth})")
+    st.info(f"Performing fan-out for H1: '{h1_text}'")
     
     # Step 1: Initial Fan-Out from H1
     initial_queries = []
     for _ in range(attempts):
-        initial_queries.extend(_fetch_single_fan_out(h1_text, 1, temp))
-    initial_queries = list(set(initial_queries)) # Basic dedupe
+        initial_queries.extend(_fetch_single_fan_out(h1_text, temp))
+    initial_queries = list(set(initial_queries))
 
     all_queries = list(initial_queries)
 
-    # Step 2: Recursive Fan-Out (if depth > 0)
-    if depth > 0 and initial_queries:
-        sub_query_progress = st.status(f"Performing recursive fan-out for {len(initial_queries)} sub-queries...", expanded=False)
-        processed_sub_queries = set()
-
-        for i, query in enumerate(initial_queries):
-            if query in processed_sub_queries:
-                continue
-            
-            sub_query_progress.write(f"Level 2 Fan-out ({i+1}/{len(initial_queries)}): '{query}'")
-            recursive_queries = _fetch_single_fan_out(query, single_attempt_count=1, temp=temp)
-            all_queries.extend(recursive_queries)
-            processed_sub_queries.add(query)
-
-        sub_query_progress.update(label="Recursive fan-out complete!", state="complete", expanded=False)
+    # Step 2: Recursive Fan-Out (if enabled)
+    if use_deep_fanout and initial_queries:
+        st.info(f"Performing deep fan-out for {len(initial_queries)} sub-queries...")
+        with st.spinner("This may take several minutes..."):
+            for i, query in enumerate(initial_queries):
+                st.write(f"Level 2 Fan-out ({i+1}/{len(initial_queries)}): '{query}'")
+                recursive_queries = _fetch_single_fan_out(query, temp=temp)
+                all_queries.extend(recursive_queries)
 
     # Step 3: Final Comprehensive Deduplication
     seen = set()
@@ -254,9 +251,13 @@ def fetch_query_fan_outs_multi(h1_text: str, attempts: int, temp: float, depth: 
             seen_canon.add(canon)
             filtered.append(q)
             
-    st.info(f"Found {len(filtered)} unique queries. Now running semantic deduplication...")
-    final_queries = dedupe_queries(filtered)
-    st.success(f"Deduplication complete. Final unique query count: {len(final_queries)}")
+    if len(filtered) > 0:
+        st.info(f"Found {len(filtered)} unique queries. Now running semantic deduplication...")
+        final_queries = dedupe_queries(filtered)
+        st.success(f"Deduplication complete. Final unique query count: {len(final_queries)}")
+    else:
+        final_queries = []
+        
     return final_queries
 
 
@@ -273,7 +274,6 @@ def get_explanations(prompt, temperature=0.1, max_retries=2):
     last_raw = ""
     for attempt in range(1, max_retries + 1):
         try:
-            # Using JSON mode for more reliable output
             resp = openai.chat.completions.create(
                 model="gpt-4o", 
                 messages=messages, 
@@ -310,7 +310,7 @@ def get_explanations(prompt, temperature=0.1, max_retries=2):
     st.warning(f"OpenAI parse failure after {max_retries} attempts. Raw output:\n{last_raw}")
     return []
 
-# --- Main audit loop (only runs when user clicks) ---
+# --- Main audit loop ---
 if start_clicked and urls and not st.session_state.processed:
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -338,9 +338,7 @@ if start_clicked and urls and not st.session_state.processed:
             soup = BeautifulSoup(html, "html.parser")
         except Exception as e:
             try:
-                scraper = cloudscraper.create_scraper(
-                    browser={"browser": "chrome", "platform": "windows", "mobile": False}
-                )
+                scraper = cloudscraper.create_scraper()
                 r = scraper.get(url, timeout=30)
                 r.raise_for_status()
                 soup = BeautifulSoup(r.text, "html.parser")
@@ -395,15 +393,16 @@ if start_clicked and urls and not st.session_state.processed:
             st.session_state.skipped.append({"Address": url, "Reason": "No H1 or Title tag found"})
             continue
         
-        if h1 in st.session_state.h1_fanout_cache:
-            fanouts = st.session_state.h1_fanout_cache[h1]
+        cache_key = f"{h1}_{use_recursion}"
+        if cache_key in st.session_state.h1_fanout_cache:
+            fanouts = st.session_state.h1_fanout_cache[cache_key]
             st.info(f"Using cached fan-out queries for H1: '{h1}'")
         else:
-            fanouts = fetch_query_fan_outs_multi(h1, attempts=attempts, temp=gemini_temp, depth=recursion_depth)
-            st.session_state.h1_fanout_cache[h1] = fanouts
+            fanouts = fetch_query_fan_outs_multi(h1, attempts=attempts, temp=gemini_temp, use_deep_fanout=use_recursion)
+            st.session_state.h1_fanout_cache[cache_key] = fanouts
         
         if not fanouts:
-            st.warning(f"Skipped {url}: no fan-out queries generated for H1 '{h1}'.")
+            st.warning(f"Skipped {url}: no fan-out queries were generated for H1 '{h1}'. Check for API rate-limit warnings above.")
             st.session_state.skipped.append({"Address": url, "Reason": f"No fan-out queries for H1: '{h1}'"})
             continue
 
