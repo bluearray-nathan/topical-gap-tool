@@ -1,48 +1,50 @@
 import subprocess
 import sys
-subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=False)
+# Ensure Playwright is installed for browser automation
+tools_install = subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=False)
 
 import time
 import streamlit as st
 import pandas as pd
 import requests
-import re
 import json
-import numpy as np
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 import cloudscraper
 import openai
 
-# --- Streamlit UI ---
+# --- Streamlit UI Configuration ---
 st.set_page_config(page_title="AI Overview/AI Mode query fan-out gap analysis", layout="wide")
-st.title("🔍 AI Overview/AI Mode query fan-out gap analysis")
+st.title("🔍 AI Overview/AI Mode Query Fan-Out Gap Analysis")
 
-st.sidebar.header("About the query fan-out gap analysis tool")
+st.sidebar.header("About this tool")
 st.sidebar.write(
-    """This identify where gaps exist in your content:
-1. Extracting your page's H1 and subheadings (H2–H4).
-2. Using Google Gemini to generate diverse user query fan-outs.
-3. Comparing those queries against content headings to identify concise missing topics."""
+    """
+This tool identifies content gaps by:
+1. Extracting your page's H1 headings.
+2. Generating user query fan-outs for each H1 query using Google Gemini.
+3. Performing a second-level fan-out on those queries to maximize coverage.
+4. Comparing all generated queries against the page's headings to highlight missing topics.
+"""
 )
 
-# Fixed settings (no user adjustment)
-gemini_temp = 0.4  # fan-out diversity
-gpt_temp = 0.1     # gap reasoning temperature
-attempts = 1       # number of Gemini aggregation calls
-candidate_count = 7  # number of candidates per Gemini call
+# --- Fixed Configuration ---
+gemini_temp = 0.4      # Diversity for fan-out generation
+gpt_temp = 0.1         # Temperature for gap reasoning
+attempts = 1           # Number of Gemini aggregation calls
+candidate_count = 7    # Number of candidates per Gemini call
 
-# Load credentials from secrets
+# --- Load API Keys from Streamlit Secrets ---
 openai.api_key = st.secrets["openai"]["api_key"]
 gemini_api_key = st.secrets["google"]["gemini_api_key"]
 
-# URL input
+# --- URL Input Area ---
 urls_input = st.text_area(
     "Enter one URL per line to audit:",
     placeholder="https://example.com/page1\nhttps://example.com/page2"
 )
 
-# Red start button styling
+# --- Style the Start Button ---
 st.markdown(
     """
     <style>
@@ -52,377 +54,274 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Session state initialization
-for key, default in {
-    "last_urls": [],
-    "processed": False,
-    "detailed": [],
-    "summary": [],
-    "actions": [],
-    "skipped": [],
-    "h1_fanout_cache": {},
-}.items():
-    if key not in st.session_state:
-        st.session_state[key] = default
+# --- Initialize Session State ---
+def init_state():
+    defaults = {
+        "last_urls": [],
+        "processed": False,
+        "detailed": [],
+        "summary": [],
+        "actions": [],
+        "skipped": [],
+        "h1_fanout_cache": {},
+        "fanout_layer2_cache": {},
+    }
+    for key, val in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = val
+init_state()
 
-# Prepare URLs list
-urls = [u.strip() for u in urls_input.splitlines() if u.strip()] if urls_input else []
+# --- Parse and Detect URL List ---
+urls = [line.strip() for line in urls_input.splitlines() if line.strip()]
 total = len(urls)
-if urls:
+if total > 0:
     st.write(f"Found {total} URLs to process.")
 
-# Reset when URLs change
+# --- Reset State When URLs Change ---
 if urls and st.session_state.last_urls != urls:
     st.session_state.last_urls = urls
     st.session_state.processed = False
-    st.session_state.detailed = []
-    st.session_state.summary = []
-    st.session_state.actions = []
-    st.session_state.skipped = []
-    st.session_state.h1_fanout_cache = {}
+    st.session_state.detailed.clear()
+    st.session_state.summary.clear()
+    st.session_state.actions.clear()
+    st.session_state.skipped.clear()
+    st.session_state.h1_fanout_cache.clear()
+    st.session_state.fanout_layer2_cache.clear()
 
-# Start button
-start_clicked = st.button("Start Audit")
-if start_clicked:
-    st.session_state.processed = False
-
-# Helpers for query normalization & dedupe
-STOPWORDS = {
-    "the", "and", "of", "in", "to", "a", "for", "with", "on", "about",
-    "vs", "vs.", "is", "are", "your", "what", "how", "why", "more",
-    "latest", "new"
-}
-
-def canonicalize_query(q: str) -> str:
-    q_lower = q.lower()
-    q_lower = re.sub(r"\b(what|how|does|do|is|are|the|a|an|of|for|to|about|your)\b", " ", q_lower)
-    q_lower = re.sub(r"\b(includes|including|inclusions)\b", " include ", q_lower)
-    q_lower = re.sub(r"\b(works|working)\b", " work ", q_lower)
-    q_lower = re.sub(r"[^\w\s]", "", q_lower)
-    q_lower = re.sub(r"\s+", " ", q_lower).strip()
-    return q_lower
-
-def content_words(s: str):
-    tokens = re.findall(r"[A-Za-z0-9]+", s.lower())
-    return [t for t in tokens if t not in STOPWORDS]
-
-def cosine(a: np.ndarray, b: np.ndarray):
-    if np.linalg.norm(a) == 0 or np.linalg.norm(b) == 0:
-        return 0.0
-    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
-
-def remove_component(vec: np.ndarray, anchor: np.ndarray):
-    denom = np.dot(anchor, anchor)
-    if denom == 0:
-        return vec
-    proj = (np.dot(vec, anchor) / denom) * anchor
-    return vec - proj
-
-def dedupe_queries(queries, raw_threshold=0.9, residual_threshold=0, embedding_model="text-embedding-ada-002"):
-    if not queries:
-        return []
-    try:
-        resp = openai.embeddings.create(model=embedding_model, input=queries)
-        query_vecs = [np.array(d["embedding"], dtype=float) for d in resp["data"]]
-    except Exception:
-        return queries
-    kept = []
-    removed = set()
-    anchor_cache = {}
-    for i, qi in enumerate(queries):
-        if i in removed:
-            continue
-        kept.append(qi)
-        vi = query_vecs[i]
-        for j in range(i + 1, len(queries)):
-            if j in removed:
-                continue
-            vj = query_vecs[j]
-            raw_sim = cosine(vi, vj)
-            if raw_sim < raw_threshold:
-                continue
-            shared = set(content_words(qi)) & set(content_words(queries[j]))
-            if shared:
-                anchor_text = " ".join(sorted(shared))
-                if anchor_text not in anchor_cache:
-                    try:
-                        a_resp = openai.embeddings.create(model=embedding_model, input=[anchor_text])
-                        anchor_cache[anchor_text] = np.array(a_resp["data"][0]["embedding"], dtype=float)
-                    except Exception:
-                        anchor_cache[anchor_text] = None
-                anchor_vec = anchor_cache.get(anchor_text)
-                if anchor_vec is not None:
-                    ri = remove_component(vi, anchor_vec)
-                    rj = remove_component(vj, anchor_vec)
-                    residual_sim = cosine(ri, rj)
-                else:
-                    residual_sim = raw_sim
-            else:
-                residual_sim = raw_sim
-            if residual_sim >= residual_threshold:
-                removed.add(j)
-    return kept
-
-def fetch_query_fan_outs_multi(h1_text, attempts=3, temp=0.0):
-    aggregated = []
-    for attempt_i in range(attempts):
+# --- Helper: Fetch Fan-Out Queries via Gemini ---
+def fetch_query_fan_outs_multi(text, attempts=1, temp=0.0):
+    queries = []
+    for _ in range(attempts):
         endpoint = (
             f"https://generativelanguage.googleapis.com/v1beta/models/"
             f"gemini-2.5-flash:generateContent?key={gemini_api_key}"
         )
         payload = {
-            "contents": [{"parts": [{"text": h1_text}]}],
+            "contents": [{"parts": [{"text": text}]}],
             "tools": [{"google_search": {}}],
-            "generationConfig": {
-                "temperature": temp,
-                "candidateCount": candidate_count
-            },
+            "generationConfig": {"temperature": temp, "candidateCount": candidate_count},
         }
         try:
-            r = requests.post(endpoint, json=payload, timeout=30)
-            r.raise_for_status()
-            for cand in r.json().get("candidates", []):
-                fanouts = cand.get("groundingMetadata", {}).get("webSearchQueries", [])
-                aggregated.extend(fanouts)
+            response = requests.post(endpoint, json=payload, timeout=30)
+            response.raise_for_status()
+            candidates = response.json().get("candidates", [])
+            for cand in candidates:
+                queries.extend(
+                    cand.get("groundingMetadata", {}).get("webSearchQueries", []) or []
+                )
         except Exception as e:
-            st.warning(f"Fan-out fetch attempt {attempt_i+1} failed: {e}")
-        time.sleep(0.2)
-    # exact dedupe
-    seen = set()
-    unique_raw = []
-    for q in aggregated:
-        if q not in seen:
-            seen.add(q)
-            unique_raw.append(q)
-    # canonical dedupe
-    seen_canon = set()
-    filtered = []
-    for q in unique_raw:
-        canon = canonicalize_query(q)
-        if canon not in seen_canon:
-            seen_canon.add(canon)
-            filtered.append(q)
-    # semantic dedupe
-    return dedupe_queries(filtered)
+            st.warning(f"Fan-out fetch failed for '{text}': {e}")
+    return queries
 
+# --- Helper: Extract H1 and Subheadings ---
+def extract_h1_and_headings(url):
+    # Try Playwright first for JS-rendered pages
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            resp = page.goto(url, timeout=60000)
+            if resp and resp.status == 403:
+                return "", [], "HTTP 403 Forbidden"
+            html = page.content()
+            browser.close()
+        soup = BeautifulSoup(html, "html.parser")
+    except Exception:
+        # Fallback to cloudscraper if Playwright fails
+        try:
+            scraper = cloudscraper.create_scraper(
+                browser={"browser": "chrome", "platform": "windows", "mobile": False}
+            )
+            r = scraper.get(url, timeout=30)
+            r.raise_for_status()
+            soup = BeautifulSoup(r.text, "html.parser")
+        except Exception:
+            return "", [], "Fetch error"
+    h1 = soup.find("h1")
+    h1_text = h1.get_text(strip=True) if h1 else ""
+    headings = [
+        (tag.name.upper(), tag.get_text(strip=True))
+        for tag in soup.find_all(["h2", "h3", "h4"])
+    ]
+    return h1_text, headings, None
+
+# --- Helper: Build the OpenAI Prompt ---
+def build_prompt(h1, headings, queries):
+    lines = [
+        "I’m auditing this page for content gaps.",
+        f"Main topic (H1): {h1}",
+        "",
+        "1) Existing headings (in order):",
+    ]
+    for lvl, txt in headings:
+        lines.append(f"{lvl}: {txt}")
+    lines.append("")
+    lines.append("2) User queries to cover:")
+    for q in queries:
+        lines.append(f"- {q}")
+    lines.append("")
+    lines.append(
+        "3) Return a JSON array with keys: query (string), covered (true/false), explanation (string)."
+    )
+    lines.append(
+        'Example: [{"query":"...","covered":true,"explanation":"..."}]'
+    )
+    return "\n".join(lines)
+
+# --- Helper: Call OpenAI for Coverage Analysis ---
 def get_explanations(prompt, temperature=0.1, max_retries=2):
     system_msg = (
-        "You are an SEO content gap auditor. Given the input, respond ONLY with a valid JSON array and nothing else. "
-        "Each item must have exactly these keys: query (string), covered (true/false), and explanation (concise string). "
-        "Do not include any extra prose. Example: [{\"query\":\"...\",\"covered\":true,\"explanation\":\"...\"}]"
+        "You are an SEO content gap auditor. Output ONLY a JSON array. "
+        "Each item must have exactly: query, covered, explanation."
     )
     messages = [
         {"role": "system", "content": system_msg},
         {"role": "user", "content": prompt},
     ]
-    last_raw = ""
-    for attempt in range(1, max_retries + 1):
+    for attempt in range(max_retries):
         try:
             resp = openai.chat.completions.create(
-                model="gpt-4o", messages=messages, temperature=temperature, max_tokens=1000
+                model="gpt-4o", messages=messages, temperature=temperature
             )
-            choice = resp.choices[0]
-            text = (
-                choice.message.content.strip()
-                if hasattr(choice, "message")
-                else choice.text.strip()
-            )
-            last_raw = text
-            cleaned = re.sub(r"^```(?:json)?\s*", "", text.strip())
-            cleaned = re.sub(r"\s*```$", "", cleaned)
-            try:
-                parsed = json.loads(cleaned)
-                if isinstance(parsed, list):
-                    return parsed
-            except json.JSONDecodeError:
-                pass
-            m = re.search(r"\[.*\]", text, flags=re.DOTALL)
-            if m:
-                try:
-                    parsed = json.loads(m.group(0))
-                    if isinstance(parsed, list):
-                        return parsed
-                except json.JSONDecodeError:
-                    pass
-            if attempt < max_retries:
-                messages.append({"role": "assistant", "content": text})
-                messages.append({
-                    "role": "user", "content": (
-                        "Previous response was not valid JSON. Please output only the JSON array exactly as specified. "
-                        "Example: [{\"query\":\"...\",\"covered\":true,\"explanation\":\"...\"}]"
-                    ),
-                })
-        except Exception as e:
-            last_raw = f"API error: {e}"
-            if attempt < max_retries:
-                time.sleep(1 * attempt)
-                continue
-    st.warning(f"OpenAI parse failure after {max_retries} attempts. Raw output:\n{last_raw}")
+            content = resp.choices[0].message.content.strip().strip("```")
+            return json.loads(content)
+        except Exception:
+            time.sleep(1)
+    st.warning("Failed to parse OpenAI response as JSON.")
     return []
 
-# Main audit loop (only runs when user clicks)
-if start_clicked and urls and not st.session_state.processed:
+# --- Main Audit Loop ---
+if st.button("Start Audit") and urls and not st.session_state.processed:
     progress_bar = st.progress(0)
     status_text = st.empty()
     start_time = time.time()
 
-    st.session_state.detailed = []
-    st.session_state.summary = []
-    st.session_state.actions = []
-    st.session_state.skipped = []
+    # Clear previous results
+    st.session_state.detailed.clear()
+    st.session_state.summary.clear()
+    st.session_state.actions.clear()
+    st.session_state.skipped.clear()
 
-    def extract_h1_and_headings(url):
-        try:
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True)
-                page = browser.new_page()
-                resp = page.goto(url, timeout=60000)
-                if resp and resp.status == 403:
-                    return "", [], "HTTP 403 Forbidden (Playwright)"
-                html = page.content()
-                browser.close()
-            soup = BeautifulSoup(html, "html.parser")
-        except Exception:
-            try:
-                scraper = cloudscraper.create_scraper(
-                    browser={"browser": "chrome", "platform": "windows", "mobile": False}
-                )
-                r = scraper.get(url, timeout=30)
-                try:
-                    r.raise_for_status()
-                except requests.exceptions.HTTPError as he:
-                    code = he.response.status_code if he.response else "unknown"
-                    reason = he.response.reason if he.response and hasattr(he.response, "reason") else ""
-                    return "", [], f"HTTP {code} {reason} (fallback)"
-                soup = BeautifulSoup(r.text, "html.parser")
-            except Exception:
-                return "", [], "Fetch failed (both Playwright and fallback)"
-        h1 = soup.find("h1").get_text(strip=True) if soup.find("h1") else ""
-        headings = [(tag.name.upper(), tag.get_text(strip=True)) for tag in soup.find_all(["h2", "h3", "h4"])]
-        return h1, headings, None
-
-    def build_prompt(h1, headings, queries):
-        lines = [
-            "I’m auditing this page for content gaps.",
-            f"Main topic (H1): {h1}",
-            "",
-            "1) Existing headings (in order):",
-        ]
-        for lvl, txt in headings:
-            lines.append(f"{lvl}: {txt}")
-        lines.extend(["", "2) User queries to cover:"])
-        for q in queries:
-            lines.append(f"- {q}")
-        lines.extend([
-            "", "3) Return JSON array of objects with keys: query, covered, explanation.",
-            'Example: [{"query":"...","covered":true,"explanation":"..."}]',
-        ])
-        return "\n".join(lines)
-
-    for idx, url in enumerate(urls):
+    for idx, url in enumerate(urls, start=1):
         elapsed = time.time() - start_time
-        avg = elapsed / (idx + 1)
-        remaining = total - (idx + 1)
-        eta_secs = remaining * avg
-        mins = int(eta_secs // 60)
-        secs = int(eta_secs % 60)
-        eta_str = f"{mins}m {secs}s" if mins > 0 else f"{secs}s"
-        progress_bar.progress(int((idx + 1) / total * 100))
-        status_text.text(f"Processing {idx+1}/{total}. ETA: {eta_str}")
+        avg_per = elapsed / idx
+        remaining = total - idx
+        eta = int(remaining * avg_per)
+        status_text.text(f"Processing {idx}/{total} — ETA: {eta}s")
+        progress_bar.progress(int(idx/total * 100))
 
-        h1, headings, err = extract_h1_and_headings(url)
-        if err:
-            if "403" in err:
-                st.error(
-                    f"❌ Could not access {url}: {err}. Possible reasons: site is behind Cloudflare/WAF, IP blocked, rate-limited, or requires JS/auth."
-                )
-                st.session_state.skipped.append(
-                    {"Address": url, "Reason": f"{err} (likely blocked/forbidden)"}
-                )
-            else:
-                st.warning(f"⚠️ Skipped {url}: {err}.")
-                st.session_state.skipped.append({"Address": url, "Reason": err})
+        # Extract headings
+        h1_text, headings, err = extract_h1_and_headings(url)
+        if err or not h1_text:
+            reason = err or "No H1 found"
+            st.warning(f"Skipped {url}: {reason}")
+            st.session_state.skipped.append({"Address": url, "Reason": reason})
             continue
-        if not h1 and not headings:
-            st.warning(f"Skipped {url}: no H1 or subheadings found.")
-            st.session_state.skipped.append({"Address": url, "Reason": "No H1 or subheadings found"})
-            continue
-        if h1 in st.session_state.h1_fanout_cache:
-            fanouts = st.session_state.h1_fanout_cache[h1]
+
+        # --- Level 1: H1 Fan-Out ---
+        if h1_text in st.session_state.h1_fanout_cache:
+            level1_queries = st.session_state.h1_fanout_cache[h1_text]
         else:
-            fanouts = fetch_query_fan_outs_multi(h1, attempts=attempts, temp=gemini_temp)
-            st.session_state.h1_fanout_cache[h1] = fanouts
-        if not fanouts:
-            st.warning(f"Skipped {url}: no fan-out queries for H1 '{h1}'.")
-            st.session_state.skipped.append(
-                {"Address": url, "Reason": f"No fan-out queries returned for H1: '{h1}'"}
+            level1_queries = fetch_query_fan_outs_multi(
+                h1_text, attempts=attempts, temp=gemini_temp
             )
+            st.session_state.h1_fanout_cache[h1_text] = level1_queries
+
+        # --- Level 2: Second-Pass Fan-Out ---
+        all_queries = []
+        for q in level1_queries:
+            if q in st.session_state.fanout_layer2_cache:
+                second_queries = st.session_state.fanout_layer2_cache[q]
+            else:
+                second_queries = fetch_query_fan_outs_multi(
+                    q, attempts=attempts, temp=gemini_temp
+                )
+                st.session_state.fanout_layer2_cache[q] = second_queries
+            all_queries.extend(second_queries)
+        all_queries = level1_queries + all_queries
+
+        if not all_queries:
+            st.warning(f"Skipped {url}: no fan-out queries generated.")
+            st.session_state.skipped.append({"Address": url, "Reason": "No queries generated"})
             continue
-        prompt = build_prompt(h1, headings, fanouts)
+
+        # --- Gap Analysis via OpenAI ---
+        prompt = build_prompt(h1_text, headings, all_queries)
         results = get_explanations(prompt, temperature=gpt_temp)
         if not results:
             st.warning(f"Skipped {url}: OpenAI returned no usable output.")
-            st.session_state.skipped.append(
-                {"Address": url, "Reason": "OpenAI returned no results or parsing failed"}
-            )
+            st.session_state.skipped.append({"Address": url, "Reason": "No results from OpenAI"})
             continue
-        covered = sum(1 for it in results if it.get("covered"))
-        pct = round((covered / len(results)) * 100) if results else 0
-        st.session_state.summary.append(
-            {"Address": url, "Fan-out Count": len(fanouts), "Coverage (%)": pct}
-        )
-        missing = [it.get("query") for it in results if not it.get("covered")]
-        st.session_state.actions.append(
-            {"Address": url, "Recommended Sections to Add to Content": "; ".join(missing)}
-        )
+
+        # --- Summaries & Actions ---
+        covered_count = sum(1 for r in results if r.get("covered"))
+        coverage_pct = int((covered_count / len(results)) * 100)
+        st.session_state.summary.append({
+            "Address": url,
+            "Fan-out Count": len(all_queries),
+            "Coverage (%)": coverage_pct
+        })
+        missing_sections = [r.get("query") for r in results if not r.get("covered")]
+        st.session_state.actions.append({
+            "Address": url,
+            "Recommended Sections to Add": "; ".join(missing_sections)
+        })
+
+        # --- Detailed Row Construction ---
         row = {
             "Address": url,
-            "H1-1": h1,
-            "Content Structure": " | ".join(f"{lvl}:{txt}" for lvl, txt in headings),
+            "H1": h1_text,
+            "Headings": " | ".join(f"{lvl}:{txt}" for lvl, txt in headings)
         }
-        for i, it in enumerate(results):
-            row[f"Query {i+1}"] = it.get("query", "")
-            row[f"Query {i+1} Covered"] = "Yes" if it.get("covered") else "No"
-            row[f"Query {i+1} Explanation"] = it.get("explanation", "")
+        for i, r in enumerate(results, start=1):
+            row[f"Query {i}"] = r.get("query")
+            row[f"Covered {i}"] = r.get("covered")
+            row[f"Explanation {i}"] = r.get("explanation")
         st.session_state.detailed.append(row)
+
     progress_bar.progress(100)
-    status_text.text("Complete!")
+    status_text.text("Audit Complete!")
     st.session_state.processed = True
 
-# Display / download final outputs
+# --- Display / Download Results ---
 if st.session_state.processed:
     st.header("Results")
-
+    # Detailed Table
     if st.session_state.detailed:
         st.subheader("Detailed")
-        df_det = pd.DataFrame(st.session_state.detailed)
+        df_detailed = pd.DataFrame(st.session_state.detailed)
         st.download_button(
-            "Download Detailed CSV", df_det.to_csv(index=False).encode("utf-8"), "detailed.csv", "text/csv"
+            "Download Detailed CSV",
+            df_detailed.to_csv(index=False).encode("utf-8"),
+            "detailed.csv", "text/csv"
         )
-        st.dataframe(df_det)
-
+        st.dataframe(df_detailed)
+    # Summary Table
     if st.session_state.summary:
         st.subheader("Summary")
-        df_sum = pd.DataFrame(st.session_state.summary)
-        base_cols = ["Address", "Fan-out Count", "Coverage (%)"]
-        ordered = [c for c in base_cols if c in df_sum.columns] + [c for c in df_sum.columns if c not in base_cols]
-        df_sum = df_sum[ordered]
+        df_summary = pd.DataFrame(st.session_state.summary)
         st.download_button(
-            "Download Summary CSV", df_sum.to_csv(index=False).encode("utf-8"), "summary.csv", "text/csv"
+            "Download Summary CSV",
+            df_summary.to_csv(index=False).encode("utf-8"),
+            "summary.csv", "text/csv"
         )
-        st.dataframe(df_sum)
-
+        st.dataframe(df_summary)
+    # Actions Table
     if st.session_state.actions:
         st.subheader("Actions")
-        df_act = pd.DataFrame(st.session_state.actions)
+        df_actions = pd.DataFrame(st.session_state.actions)
         st.download_button(
-            "Download Actions CSV", df_act.to_csv(index=False).encode("utf-8"), "actions.csv", "text/csv"
+            "Download Actions CSV",
+            df_actions.to_csv(index=False).encode("utf-8"),
+            "actions.csv", "text/csv"
         )
-        st.dataframe(df_act)
-
+        st.dataframe(df_actions)
+    # Skipped URLs
     if st.session_state.skipped:
-        st.subheader("Skipped URLs and Reasons")
-        st.table(pd.DataFrame(st.session_state.skipped))
+        st.subheader("Skipped URLs & Reasons")
+        df_skipped = pd.DataFrame(st.session_state.skipped)
+        st.table(df_skipped)
+
 
 
 
