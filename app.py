@@ -202,8 +202,9 @@ def _fetch_single_fan_out(text_to_fan_out: str, single_attempt_count: int, temp:
             fanouts = cand.get("groundingMetadata", {}).get("webSearchQueries", [])
             queries.extend(fanouts)
     except Exception as e:
-        # Fail silently for sub-queries to avoid cluttering the UI
-        pass
+    # Temporarily expose the error for debugging
+    st.error(f"A fan-out API call failed: {e}")
+    st.error(f"Payload sent: {json.dumps(payload, indent=2)}") # Also show what was sent
     time.sleep(0.5) # API rate limiting
     return list(set(queries)) # Return unique queries from this call
 
