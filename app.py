@@ -8,6 +8,7 @@ import streamlit as st
 import pandas as pd
 import requests
 import json
+import re
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 import cloudscraper
@@ -30,13 +31,13 @@ This tool identifies content gaps by:
 
 # --- Fixed Configuration ---
 gemini_temp = 0.4      # Diversity for fan-out generation
-gpt_temp    = 0.1      # Temperature for gap reasoning
-attempts    = 1        # Number of Gemini aggregation calls
-candidate_count = 7    # Number of candidates per call
+gpt_temp = 0.1         # Temperature for gap reasoning
+attempts = 1           # Number of Gemini aggregation calls
+candidate_count = 7    # Number of candidates per Gemini call
 
 # --- Load API Keys from Streamlit Secrets ---
-openai.api_key     = st.secrets["openai"]["api_key"]
-gemini_api_key     = st.secrets["google"]["gemini_api_key"]
+openai.api_key = st.secrets["openai"]["api_key"]
+gemini_api_key = st.secrets["google"]["gemini_api_key"]
 
 # --- URL Input Area ---
 urls_input = st.text_area(
@@ -48,10 +49,7 @@ urls_input = st.text_area(
 st.markdown(
     """
     <style>
-      div.stButton > button:first-child {
-        background-color: #e63946;
-        color: white;
-      }
+    div.stButton > button:first-child { background-color: #e63946; color: white; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -69,13 +67,13 @@ def init_state():
         "h1_fanout_cache": {},
         "fanout_layer2_cache": {},
     }
-    for k, v in defaults.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
+    for key, val in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = val
 init_state()
 
 # --- Parse and Detect URL List ---
-urls  = [u.strip() for u in urls_input.splitlines() if u.strip()]
+urls = [line.strip() for line in urls_input.splitlines() if line.strip()]
 total = len(urls)
 if total > 0:
     st.write(f"Found {total} URLs to process.")
@@ -101,13 +99,14 @@ def fetch_query_fan_outs_multi(text, attempts=1, temp=0.0):
         )
         payload = {
             "contents": [{"parts": [{"text": text}]}],
-            "tools":    [{"google_search": {}}],
+            "tools": [{"google_search": {}}],
             "generationConfig": {"temperature": temp, "candidateCount": candidate_count},
         }
         try:
-            r = requests.post(endpoint, json=payload, timeout=30)
-            r.raise_for_status()
-            for cand in r.json().get("candidates", []):
+            response = requests.post(endpoint, json=payload, timeout=30)
+            response.raise_for_status()
+            candidates = response.json().get("candidates", [])
+            for cand in candidates:
                 queries.extend(
                     cand.get("groundingMetadata", {}).get("webSearchQueries", []) or []
                 )
@@ -117,7 +116,6 @@ def fetch_query_fan_outs_multi(text, attempts=1, temp=0.0):
 
 # --- Helper: Extract H1 and Subheadings ---
 def extract_h1_and_headings(url):
-    # Try Playwright first
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
@@ -129,10 +127,9 @@ def extract_h1_and_headings(url):
             browser.close()
         soup = BeautifulSoup(html, "html.parser")
     except Exception:
-        # Fallback to cloudscraper
         try:
             scraper = cloudscraper.create_scraper(
-                browser={"browser":"chrome","platform":"windows","mobile":False}
+                browser={"browser": "chrome", "platform": "windows", "mobile": False}
             )
             r = scraper.get(url, timeout=30)
             r.raise_for_status()
@@ -142,8 +139,7 @@ def extract_h1_and_headings(url):
     h1 = soup.find("h1")
     h1_text = h1.get_text(strip=True) if h1 else ""
     headings = [
-        (tag.name.upper(), tag.get_text(strip=True))
-        for tag in soup.find_all(["h2","h3","h4"])
+        (tag.name.upper(), tag.get_text(strip=True)) for tag in soup.find_all(["h2","h3","h4"])
     ]
     return h1_text, headings, None
 
@@ -175,36 +171,42 @@ def get_explanations(prompt, temperature=0.1, max_retries=2):
         "Each item must have exactly: query, covered, explanation."
     )
     messages = [
-        {"role":"system","content":system_msg},
-        {"role":"user","content":prompt},
+        {"role": "system", "content": system_msg},
+        {"role": "user", "content": prompt},
     ]
-    for _ in range(max_retries):
+    last_resp = ""
+    for attempt in range(max_retries):
         try:
             resp = openai.chat.completions.create(
                 model="gpt-4o", messages=messages, temperature=temperature
             )
-            content = resp.choices[0].message.content.strip().strip("```")
-            return json.loads(content)
+            text = resp.choices[0].message.content.strip()
+            last_resp = text
+            # Extract JSON array
+            match = re.search(r"\[.*\]", text, flags=re.DOTALL)
+            if match:
+                return json.loads(match.group(0))
         except Exception:
             time.sleep(1)
-    st.warning("Failed to parse OpenAI response as JSON.")
+    st.warning(f"Failed to parse OpenAI response as JSON. Raw response: {last_resp}")
     return []
 
 # --- Main Audit Loop ---
 if st.button("Start Audit") and urls and not st.session_state.processed:
     progress_bar = st.progress(0)
-    status_text  = st.empty()
-    start_time   = time.time()
+    status_text = st.empty()
+    start_time = time.time()
 
-    # clear previous
     st.session_state.detailed.clear()
     st.session_state.summary.clear()
     st.session_state.actions.clear()
     st.session_state.skipped.clear()
 
     for idx, url in enumerate(urls, start=1):
-        elapsed   = time.time() - start_time
-        eta       = int((elapsed/idx)*(total-idx))
+        elapsed = time.time() - start_time
+        avg_per = elapsed / idx
+        rem = total - idx
+        eta = int(rem * avg_per)
         status_text.text(f"Processing {idx}/{total} — ETA: {eta}s")
         progress_bar.progress(int(idx/total*100))
 
@@ -215,63 +217,44 @@ if st.button("Start Audit") and urls and not st.session_state.processed:
             st.session_state.skipped.append({"Address":url,"Reason":reason})
             continue
 
-        # Level 1
-        if h1_text in st.session_state.h1_fanout_cache:
-            lvl1 = st.session_state.h1_fanout_cache[h1_text]
-        else:
-            lvl1 = fetch_query_fan_outs_multi(h1_text, attempts, gemini_temp)
-            st.session_state.h1_fanout_cache[h1_text] = lvl1
+        # Level 1 fan-out
+        lvl1 = st.session_state.h1_fanout_cache.get(h1_text) or fetch_query_fan_outs_multi(h1_text, attempts, gemini_temp)
+        st.session_state.h1_fanout_cache[h1_text] = lvl1
 
-        # Level 2
+        # Level 2 fan-out
         all_qs = []
         for q in lvl1:
-            if q in st.session_state.fanout_layer2_cache:
-                sub = st.session_state.fanout_layer2_cache[q]
-            else:
-                sub = fetch_query_fan_outs_multi(q, attempts, gemini_temp)
-                st.session_state.fanout_layer2_cache[q] = sub
+            sub = st.session_state.fanout_layer2_cache.get(q) or fetch_query_fan_outs_multi(q, attempts, gemini_temp)
+            st.session_state.fanout_layer2_cache[q] = sub
             all_qs.extend(sub)
         all_qs = lvl1 + all_qs
 
         if not all_qs:
-            st.warning(f"Skipped {url}: no fan-out queries generated.")
-            st.session_state.skipped.append({"Address":url,"Reason":"No queries generated"})
+            st.warning(f"Skipped {url}: no queries generated.")
+            st.session_state.skipped.append({"Address":url,"Reason":"No queries"})
             continue
 
-        prompt  = build_prompt(h1_text, headings, all_qs)
+        prompt = build_prompt(h1_text, headings, all_qs)
         results = get_explanations(prompt, temperature=gpt_temp)
         if not results:
             st.warning(f"Skipped {url}: OpenAI returned no usable output.")
-            st.session_state.skipped.append({"Address":url,"Reason":"No results from OpenAI"})
+            st.session_state.skipped.append({"Address":url,"Reason":"No usable output"})
             continue
 
         covered = sum(1 for r in results if r.get("covered"))
-        pct     = int((covered/len(results))*100)
-        st.session_state.summary.append({
-            "Address": url,
-            "Fan-out Count": len(all_qs),
-            "Coverage (%)": pct
-        })
-        missing = [r["query"] for r in results if not r.get("covered")]
-        st.session_state.actions.append({
-            "Address": url,
-            "Recommended Sections to Add": "; ".join(missing)
-        })
+        pct = int((covered/len(results))*100)
+        st.session_state.summary.append({"Address":url,"Fan-out Count":len(all_qs),"Coverage (%)":pct})
+        missing = [r.get("query") for r in results if not r.get("covered")]
+        st.session_state.actions.append({"Address":url,"Recommended Sections to Add":"; ".join(missing)})
 
-        row = {
-            "Address": url,
-            "H1":       h1_text,
-            "Headings": " | ".join(f"{l}:{t}" for l,t in headings)
-        }
-        for i, r in enumerate(results, start=1):
-            row[f"Query {i}"]       = r.get("query")
-            row[f"Covered {i}"]     = r.get("covered")
-            row[f"Explanation {i}"] = r.get("explanation")
+        row = {"Address":url,"H1":h1_text,"Headings":" | ".join(f"{l}:{t}" for l,t in headings)}
+        for i,r in enumerate(results, start=1):
+            row[f"Query {i}"]=r.get("query"); row[f"Covered {i}"]=r.get("covered"); row[f"Explanation {i}"]=r.get("explanation")
         st.session_state.detailed.append(row)
 
     progress_bar.progress(100)
     status_text.text("Audit Complete!")
-    st.session_state.processed = True
+    st.session_state.processed=True
 
 # --- Display / Download Results ---
 if st.session_state.processed:
@@ -294,6 +277,7 @@ if st.session_state.processed:
     if st.session_state.skipped:
         st.subheader("Skipped URLs & Reasons")
         st.table(pd.DataFrame(st.session_state.skipped))
+
 
 
 
