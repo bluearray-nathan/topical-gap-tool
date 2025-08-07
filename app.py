@@ -103,7 +103,7 @@ def fetch_query_fan_outs_multi(text, attempts=1, temp=0.0):
             "generationConfig": {"temperature": temp, "candidateCount": candidate_count},
         }
         try:
-            response = requests.post(endpoint, json=payload, timeout=30)
+            response = requests.post(endpoint, json=payload, timeout=60)
             response.raise_for_status()
             candidates = response.json().get("candidates", [])
             for cand in candidates:
