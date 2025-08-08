@@ -1,7 +1,7 @@
 import subprocess
 import sys
 # Ensure Playwright is installed for browser automation
-tools_install = subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=False)
+subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=False)
 
 import time
 import json
@@ -15,6 +15,7 @@ from playwright.sync_api import sync_playwright
 import cloudscraper
 import openai
 from requests.exceptions import ReadTimeout
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Optional fuzzy matching (RapidFuzz). Falls back to a simple Jaccard if unavailable.
 try:
@@ -31,32 +32,40 @@ st.sidebar.header("About this tool")
 st.sidebar.write(
     """
 This tool identifies content gaps by:
-1. Extracting your page's H1 headings and body text.
-2. Generating user query fan-outs for each H1 query using Google Gemini.
-3. Performing a second-level fan-out on those queries to maximize coverage.
-4. Comparing all generated queries against the page's full content to highlight missing topics.
+1) Extracting your page's H1, headings, and body text.
+2) Generating user query fan-outs for the H1 (Gemini).
+3) Doing a second-level fan-out on those queries.
+4) Comparing all queries against the page content to find missing topics.
 """
 )
 
 # --- Fixed Configuration ---
-gemini_temp = 0.4      # Diversity for fan-out generation
-gpt_temp    = 0.1      # Temperature for gap reasoning
-attempts    = 1        # Number of Gemini aggregation calls
-candidate_count = 7    # Number of candidates per call
-BODY_CHAR_LIMIT = 2000 # Send only first N chars of body text to keep tokens sane
+gemini_temp       = 0.4      # Diversity for fan-out generation
+gpt_temp          = 0.1      # Temperature for gap reasoning
+attempts          = 1        # Number of Gemini aggregation calls per input
+candidate_count   = 7        # Default candidates per Gemini call
+BODY_CHAR_LIMIT   = 2000     # Send only first N chars of body text to GPT
 
 # --- Dedupe Controls (Sidebar) ---
 st.sidebar.subheader("Dedupe Options")
-enable_dedupe = st.sidebar.checkbox("Enable dedupe", value=True)
-fuzzy_ratio   = st.sidebar.slider("Fuzzy token-set threshold", 80, 100, 92)
-embed_on      = st.sidebar.checkbox("Use embedding dedupe", value=True)
-embed_thr_pct = st.sidebar.slider("Embedding cosine threshold (%)", 70, 99, 86)
-embed_threshold = embed_thr_pct / 100.0
-embed_model   = st.sidebar.selectbox("Embedding model", ["text-embedding-3-small", "text-embedding-3-large"], index=0)
+enable_dedupe      = st.sidebar.checkbox("Enable dedupe", value=True)
+fuzzy_ratio        = st.sidebar.slider("Fuzzy token-set threshold", 80, 100, 92)
+embed_on           = st.sidebar.checkbox("Use embedding dedupe", value=True)
+embed_thr_pct      = st.sidebar.slider("Embedding cosine threshold (%)", 70, 99, 86)
+embed_threshold    = embed_thr_pct / 100.0
+embed_model        = st.sidebar.selectbox("Embedding model", ["text-embedding-3-small", "text-embedding-3-large"], index=0)
+
+# --- Performance Controls (Sidebar) ---
+st.sidebar.subheader("Performance")
+max_workers        = st.sidebar.slider("Level-2 parallel workers", 2, 12, 6)
+lvl2_candidates    = st.sidebar.slider("Level-2 candidateCount", 1, 7, 4)
+lvl2_timeout       = st.sidebar.slider("Level-2 timeout (seconds)", 5, 60, 15)
+lvl1_timeout       = st.sidebar.slider("Level-1 timeout (seconds)", 5, 60, 30)
+gpt_batch_size     = st.sidebar.slider("GPT coverage batch size", 4, 16, 8)
 
 # --- Load API Keys from Streamlit Secrets ---
-openai.api_key = st.secrets["openai"]["api_key"]
-gemini_api_key = st.secrets["google"]["gemini_api_key"]
+openai.api_key   = st.secrets["openai"]["api_key"]
+gemini_api_key   = st.secrets["google"]["gemini_api_key"]
 
 # --- URL Input Area ---
 urls_input = st.text_area(
@@ -121,7 +130,6 @@ STOPWORDS = {
 def canonicalize(q: str) -> str:
     q = q.lower()
     q = re.sub(r"[^\w\s]", " ", q)  # punctuation -> space
-    # remove common stopwords
     if STOPWORDS:
         q = re.sub(r"\b(" + "|".join(map(re.escape, STOPWORDS)) + r")\b", " ", q)
     q = re.sub(r"\s+", " ", q).strip()
@@ -132,10 +140,8 @@ def _token_set_ratio(a: str, b: str) -> int:
         return int(fuzz.token_set_ratio(a, b))
     # Fallback: simple Jaccard on token sets scaled to 0..100
     ta, tb = set(canonicalize(a).split()), set(canonicalize(b).split())
-    if not ta and not tb:
-        return 100
-    if not ta or not tb:
-        return 0
+    if not ta and not tb: return 100
+    if not ta or not tb:  return 0
     jacc = len(ta & tb) / len(ta | tb)
     return int(round(jacc * 100))
 
@@ -145,8 +151,7 @@ def dedupe_exact(queries):
     for q in queries:
         c = canonicalize(q)
         if c in seen:
-            # attach to first representative for that canonical form
-            # find rep already stored with that canonical form
+            # attach to the first representative with same canonical form
             for rep in kept:
                 if canonicalize(rep) == c:
                     groups[rep].append(q)
@@ -175,7 +180,6 @@ def dedupe_token_set(queries, min_ratio=92):
 
 def get_embeddings(queries, model="text-embedding-3-small"):
     resp = openai.embeddings.create(model=model, input=queries)
-    # Support both SDK styles (attribute or dict-like)
     data = getattr(resp, "data", None) or resp["data"]
     out = []
     for d in data:
@@ -187,8 +191,7 @@ def get_embeddings(queries, model="text-embedding-3-small"):
 
 def cosine(a, b):
     na = np.linalg.norm(a); nb = np.linalg.norm(b)
-    if na == 0 or nb == 0:
-        return 0.0
+    if na == 0 or nb == 0: return 0.0
     return float(np.dot(a, b) / (na * nb))
 
 def dedupe_embeddings(queries, threshold=0.86, model="text-embedding-3-small"):
@@ -199,17 +202,13 @@ def dedupe_embeddings(queries, threshold=0.86, model="text-embedding-3-small"):
     except Exception as e:
         st.warning(f"Embedding dedupe skipped (embedding error): {e}")
         return queries, {q: [q] for q in queries}
-    kept = []
-    groups = {}
-    removed = set()
+    kept, groups, removed = [], {}, set()
     for i, qi in enumerate(queries):
-        if i in removed:
-            continue
+        if i in removed: continue
         kept.append(qi)
         groups[qi] = [qi]
         for j in range(i+1, len(queries)):
-            if j in removed:
-                continue
+            if j in removed: continue
             sim = cosine(vecs[i], vecs[j])
             if sim >= threshold:
                 groups[qi].append(queries[j])
@@ -227,49 +226,50 @@ def dedupe_pipeline(
     if not queries:
         return [], {}
     q = queries[:]
-    merged_groups = {q_: [q_] for q_ in q}
 
+    # 1) exact canonical
     if use_exact:
-        q, groups = dedupe_exact(q)
-        merged_groups = groups  # reset to exact-group view
+        q, groups_exact = dedupe_exact(q)
+    else:
+        groups_exact = {x: [x] for x in q}
 
-    q2, groups2 = dedupe_token_set(q, min_ratio=fuzzy_ratio)
-    # merge exact groups into token-set representatives
-    merged_groups_ts = {rep: [] for rep in q2}
+    # 2) token-set
+    q2, groups_ts = dedupe_token_set(q, min_ratio=fuzzy_ratio)
+
+    # Merge exact groups into token-set reps
+    merged_ts = {rep: [] for rep in q2}
     for rep in q2:
-        merged_groups_ts[rep].extend(groups2[rep])
-    # Rebuild: ensure each original item is in some rep
-    # (groups2 already handles it)
+        merged_ts[rep].extend(groups_ts[rep])
 
+    # 3) embeddings
     if use_embed and len(q2) > 1:
         reps, sem_groups = dedupe_embeddings(q2, threshold=embed_threshold, model=embed_model)
         final_groups = {r: [] for r in reps}
         for r in reps:
             for member in sem_groups[r]:
-                final_groups[r].extend(merged_groups_ts.get(member, [member]))
+                final_groups[r].extend(merged_ts.get(member, [member]))
         # unique + preserve order
         for r in final_groups:
-            seen = set()
-            deduped = []
+            seen, ded = set(), []
             for item in final_groups[r]:
                 if item not in seen:
-                    seen.add(item)
-                    deduped.append(item)
-            final_groups[r] = deduped
+                    seen.add(item); ded.append(item)
+            final_groups[r] = ded
         return reps, final_groups
 
-    return q2, merged_groups_ts
+    return q2, merged_ts
 
 # =========================
-# FETCH FAN-OUTS
+# FETCH FAN-OUTS (parametrized + retries)
 # =========================
 
-def fetch_query_fan_outs_multi(text, attempts=1, temp=0.0):
+def fetch_query_fan_outs_multi(text, attempts=1, temp=0.0, cand_count=None, timeout_s=60):
     """
     Generate fan-out queries via Gemini, with retries on ReadTimeout.
     """
+    cand = cand_count if cand_count is not None else candidate_count
     queries = []
-    for attempt_i in range(attempts):
+    for _ in range(attempts):
         endpoint = (
             f"https://generativelanguage.googleapis.com/v1beta/models/"
             f"gemini-2.5-flash:generateContent?key={gemini_api_key}"
@@ -277,19 +277,17 @@ def fetch_query_fan_outs_multi(text, attempts=1, temp=0.0):
         payload = {
             "contents": [{"parts": [{"text": text}]}],
             "tools": [{"google_search": {}}],
-            "generationConfig": {"temperature": temp, "candidateCount": candidate_count},
+            "generationConfig": {"temperature": temp, "candidateCount": cand},
         }
         # Retry loop for transient read timeouts
         response = None
-        for retry in range(3):
+        for retry in range(2):
             try:
-                response = requests.post(endpoint, json=payload, timeout=60)
+                response = requests.post(endpoint, json=payload, timeout=timeout_s)
                 response.raise_for_status()
                 break
             except ReadTimeout:
-                st.warning(f"ReadTimeout on fan-out fetch for '{text}' (attempt {retry+1}/3), retrying...")
-                time.sleep(1)
-                continue
+                time.sleep(0.8)
             except Exception as e:
                 st.warning(f"Fan-out fetch failed for '{text}': {e}")
                 break
@@ -303,46 +301,76 @@ def fetch_query_fan_outs_multi(text, attempts=1, temp=0.0):
             st.warning(f"Error parsing fan-out response JSON for '{text}': {e}")
     return queries
 
+def expand_level2_parallel(level1, attempts=1, temp=0.4, max_workers=6, cand_count=4, timeout_s=15):
+    results = []
+    if not level1:
+        return results
+    with ThreadPoolExecutor(max_workers=min(max_workers, max(1, len(level1)))) as ex:
+        futs = {
+            ex.submit(fetch_query_fan_outs_multi, q, attempts, temp, cand_count, timeout_s): q
+            for q in level1
+        }
+        for fut in as_completed(futs):
+            try:
+                results.extend(fut.result() or [])
+            except Exception as e:
+                st.warning(f"Level-2 expansion error: {e}")
+    return results
+
 # =========================
-# CONTENT EXTRACTION
+# CONTENT EXTRACTION (fast path first)
 # =========================
 
-def extract_content(url):
+def extract_content_fast(url):
+    """Fast path: static fetch via cloudscraper."""
+    scraper = cloudscraper.create_scraper(
+        browser={"browser": "chrome", "platform": "windows", "mobile": False}
+    )
+    r = scraper.get(url, timeout=20)
+    r.raise_for_status()
+    return BeautifulSoup(r.text, "html.parser")
+
+def extract_content_playwright(url):
+    """Slow path: JS-rendered fetch via Playwright."""
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+        resp = page.goto(url, timeout=45000)
+        if resp and resp.status == 403:
+            raise RuntimeError("HTTP 403 Forbidden")
+        html = page.content()
+        browser.close()
+    return BeautifulSoup(html, "html.parser")
+
+# Cache extraction across runs
+@st.cache_data(show_spinner=False, ttl=3600)
+def cached_extract(url):
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
-            resp = page.goto(url, timeout=60000)
-            if resp and resp.status == 403:
-                return "", [], "", "HTTP 403 Forbidden"
-            html = page.content()
-            browser.close()
-        soup = BeautifulSoup(html, "html.parser")
+        soup = extract_content_fast(url)
+        if not soup.find("h1"):
+            # fallback if static fetch didn't surface a heading
+            soup = extract_content_playwright(url)
     except Exception:
-        try:
-            scraper = cloudscraper.create_scraper(
-                browser={"browser":"chrome","platform":"windows","mobile":False}
-            )
-            r = scraper.get(url, timeout=60)
-            r.raise_for_status()
-            soup = BeautifulSoup(r.text, "html.parser")
-        except Exception:
-            return "", [], "", "Fetch error"
+        # ultimate fallback to Playwright
+        soup = extract_content_playwright(url)
 
-    # H1 and subheadings
     h1_tag = soup.find("h1")
     h1_text = h1_tag.get_text(strip=True) if h1_tag else ""
     headings = [(tag.name.upper(), tag.get_text(strip=True)) for tag in soup.find_all(["h2","h3","h4"])]
 
-    # Body text: paragraphs and list items
     paragraphs = [p.get_text(strip=True) for p in soup.find_all("p")]
     list_items = [li.get_text(strip=True) for li in soup.find_all("li")]
     body = "\n".join(paragraphs + list_items)
 
     return h1_text, headings, body, None
 
+# Cache fanouts across runs
+@st.cache_data(show_spinner=False, ttl=86400)
+def cached_fanouts(text, cand_count, temp, timeout_s):
+    return fetch_query_fan_outs_multi(text, attempts=attempts, temp=temp, cand_count=cand_count, timeout_s=timeout_s)
+
 # =========================
-# PROMPT BUILDING + GPT CALL
+# PROMPT BUILDING + GPT CALL (batched)
 # =========================
 
 def build_prompt(h1, headings, body, queries):
@@ -385,9 +413,20 @@ def get_explanations(prompt, temperature=0.1, max_retries=2):
             if match:
                 return json.loads(match.group(0))
         except Exception:
-            time.sleep(1)
+            time.sleep(0.8)
     st.warning(f"Failed to parse OpenAI response as JSON. Raw response: {last_resp}")
     return []
+
+def chunked(iterable, n):
+    for i in range(0, len(iterable), n):
+        yield iterable[i:i+n]
+
+def get_explanations_batched(h1, headings, body, queries, batch_size=8, temperature=0.1):
+    out = []
+    for group in chunked(queries, batch_size):
+        prompt = build_prompt(h1, headings, body, group)
+        out.extend(get_explanations(prompt, temperature=temperature))
+    return out
 
 # =========================
 # MAIN AUDIT LOOP
@@ -395,8 +434,8 @@ def get_explanations(prompt, temperature=0.1, max_retries=2):
 
 if st.button("Start Audit") and urls and not st.session_state.processed:
     progress_bar = st.progress(0)
-    status_text = st.empty()
-    start_time = time.time()
+    status_text  = st.empty()
+    start_time   = time.time()
 
     # Clear previous results
     st.session_state.detailed.clear()
@@ -410,24 +449,38 @@ if st.button("Start Audit") and urls and not st.session_state.processed:
         status_text.text(f"Processing {idx}/{total} — ETA: {eta}s")
         progress_bar.progress(int(idx/total*100))
 
-        h1_text, headings, body, err = extract_content(url)
+        # Content extraction (cached)
+        try:
+            h1_text, headings, body, err = cached_extract(url)
+        except Exception as e:
+            st.warning(f"Skipped {url}: fetch error ({e})")
+            st.session_state.skipped.append({"Address": url, "Reason": "Fetch error"})
+            continue
+
         if err or not h1_text:
             reason = err or "No H1 found"
             st.warning(f"Skipped {url}: {reason}")
             st.session_state.skipped.append({"Address": url, "Reason": reason})
             continue
 
-        # Level 1 fan-out
-        lvl1 = st.session_state.h1_fanout_cache.get(h1_text) or fetch_query_fan_outs_multi(h1_text, attempts, gemini_temp)
+        # Level 1 fan-out (cached)
+        lvl1 = st.session_state.h1_fanout_cache.get(h1_text) or cached_fanouts(h1_text, 7, gemini_temp, lvl1_timeout)
         st.session_state.h1_fanout_cache[h1_text] = lvl1
 
-        # Level 2 fan-out
-        all_qs = []
-        for q in lvl1:
-            sub = st.session_state.fanout_layer2_cache.get(q) or fetch_query_fan_outs_multi(q, attempts, gemini_temp)
-            st.session_state.fanout_layer2_cache[q] = sub
-            all_qs.extend(sub)
-        all_qs = lvl1 + all_qs
+        # Level 2 fan-out (parallel & lighter)
+        level2 = st.session_state.fanout_layer2_cache.get(("__lvl2__", h1_text))
+        if level2 is None:
+            level2 = expand_level2_parallel(
+                lvl1,
+                attempts=attempts,
+                temp=gemini_temp,
+                max_workers=max_workers,
+                cand_count=lvl2_candidates,
+                timeout_s=lvl2_timeout
+            )
+            st.session_state.fanout_layer2_cache[("__lvl2__", h1_text)] = level2
+
+        all_qs = lvl1 + level2
 
         if not all_qs:
             st.warning(f"Skipped {url}: no queries generated.")
@@ -451,9 +504,10 @@ if st.button("Start Audit") and urls and not st.session_state.processed:
             queries_for_prompt = raw_queries
             grouped_view = {q: q for q in raw_queries}
 
-        # Build prompt & call GPT
-        prompt = build_prompt(h1_text, headings, body, queries_for_prompt)
-        results = get_explanations(prompt, temperature=gpt_temp)
+        # Build prompt & call GPT (batched)
+        results = get_explanations_batched(
+            h1_text, headings, body, queries_for_prompt, batch_size=gpt_batch_size, temperature=gpt_temp
+        )
         if not results:
             st.warning(f"Skipped {url}: OpenAI returned no usable output.")
             st.session_state.skipped.append({"Address": url, "Reason": "No usable output from OpenAI"})
@@ -465,11 +519,14 @@ if st.button("Start Audit") and urls and not st.session_state.processed:
         st.session_state.summary.append({
             "Address": url,
             "Fan-out Count (raw)": len(raw_queries),
-            "Queries Used (after dedupe)" : len(queries_for_prompt),
+            "Queries Used (after dedupe)": len(queries_for_prompt),
             "Coverage (%)": pct
         })
         missing = [r.get("query") for r in results if not r.get("covered")]
-        st.session_state.actions.append({"Address": url, "Recommended Sections to Add": "; ".join(missing)})
+        st.session_state.actions.append({
+            "Address": url,
+            "Recommended Sections to Add": "; ".join(missing)
+        })
 
         # Detailed row
         row = {
@@ -479,7 +536,6 @@ if st.button("Start Audit") and urls and not st.session_state.processed:
             "All Queries (raw)": "; ".join(raw_queries),
             "Queries Used (final)": "; ".join(queries_for_prompt),
         }
-        # Include grouped variants for transparency (only when dedupe enabled)
         if enable_dedupe:
             row["Dedupe Groups"] = " || ".join([f"{rep} => {members}" for rep, members in grouped_view.items()])
 
