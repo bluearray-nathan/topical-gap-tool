@@ -6,3 +6,4 @@ beautifulsoup4
 openai
 cloudscraper
 playwright
+google-cloud-storage>=2.16.0
