@@ -9,12 +9,18 @@ import pandas as pd
 import requests
 import json
 import re
-from datetime import datetime
+import numpy as np
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 import cloudscraper
 import openai
-from requests.exceptions import ReadTimeout
+
+# Optional fuzzy matching (RapidFuzz). Falls back to a simple Jaccard if unavailable.
+try:
+    from rapidfuzz import fuzz
+    HAVE_RAPIDFUZZ = True
+except Exception:
+    HAVE_RAPIDFUZZ = False
 
 # --- Streamlit UI Configuration ---
 st.set_page_config(page_title="AI Overview/AI Mode query fan-out gap analysis", layout="wide")
@@ -36,11 +42,15 @@ gemini_temp = 0.4      # Diversity for fan-out generation
 gpt_temp    = 0.1      # Temperature for gap reasoning
 attempts    = 1        # Number of Gemini aggregation calls
 candidate_count = 7    # Number of candidates per call
-BODY_CHAR_LIMIT = 2000 # Limit body text passed to GPT
 
-# --- Normalization (Sidebar) ---
-st.sidebar.subheader("Normalization")
-normalize_year_suffix = st.sidebar.checkbox("Strip trailing years (e.g., '2024' or '2024/25')", value=True)
+# --- Dedupe Controls (Sidebar) ---
+st.sidebar.subheader("Dedupe Options")
+enable_dedupe   = st.sidebar.checkbox("Enable dedupe", value=True)
+fuzzy_ratio     = st.sidebar.slider("Fuzzy token-set threshold", 80, 100, 92)
+embed_on        = st.sidebar.checkbox("Use embedding dedupe", value=True)
+embed_thr_pct   = st.sidebar.slider("Embedding cosine threshold (%)", 70, 99, 86)
+embed_threshold = embed_thr_pct / 100.0
+embed_model     = st.sidebar.selectbox("Embedding model", ["text-embedding-3-small", "text-embedding-3-large"], index=0)
 
 # --- Load API Keys from Streamlit Secrets ---
 openai.api_key = st.secrets["openai"]["api_key"]
@@ -96,38 +106,157 @@ if urls and st.session_state.last_urls != urls:
     st.session_state.h1_fanout_cache.clear()
     st.session_state.fanout_layer2_cache.clear()
 
-# --- Helper: Strip trailing year(s) from queries ---
-# Handles endings like: " ... 2024", " ... (2024)", " ... in 2024", " ... 2024/25", " ... 2024-2025"
-YEAR_SUFFIX_RE = re.compile(r"""
-    (?:\s*[\(\-]?\s*)        # optional spacing / '(' / '-' before the year
-    (?:in\s+)?               # optional 'in '
-    ((?:19|20)\d{2})         # base 4-digit year (capture)
-    (?:\s*/\s*\d{2}          # ' /25' short range
-       |-(?:19|20)\d{2}      # or '-2025' full range
-    )?                       # optional year-range
-    \)?\s*$                  # optional ')' then end of string
-""", re.IGNORECASE | re.VERBOSE)
+# =========================
+# DEDUPE UTILITIES
+# =========================
 
-def strip_trailing_years(q: str, min_year: int = 2000, max_year: int | None = None) -> str:
-    """Remove a trailing year or year-range only at the end of the query."""
-    if max_year is None:
-        max_year = datetime.now().year + 1  # allow next-year planning queries
+STOPWORDS = {
+    "the","and","of","in","to","a","for","with","on","about",
+    "vs","vs.","is","are","your","what","how","why","more",
+    "latest","new","does","do","an"
+}
 
-    m = YEAR_SUFFIX_RE.search(q)
-    if not m:
-        return q
-    try:
-        y = int(m.group(1))
-    except Exception:
-        return q
-    if min_year <= y <= max_year:
-        return q[:m.start()].rstrip()
+def canonicalize(q: str) -> str:
+    q = q.lower()
+    q = re.sub(r"[^\w\s]", " ", q)  # punctuation -> space
+    if STOPWORDS:
+        q = re.sub(r"\b(" + "|".join(map(re.escape, STOPWORDS)) + r")\b", " ", q)
+    q = re.sub(r"\s+", " ", q).strip()
     return q
 
+def _token_set_ratio(a: str, b: str) -> int:
+    if HAVE_RAPIDFUZZ:
+        return int(fuzz.token_set_ratio(a, b))
+    # Fallback: simple Jaccard on token sets scaled to 0..100
+    ta, tb = set(canonicalize(a).split()), set(canonicalize(b).split())
+    if not ta and not tb: return 100
+    if not ta or not tb:  return 0
+    jacc = len(ta & tb) / len(ta | tb)
+    return int(round(jacc * 100))
+
+def dedupe_exact(queries):
+    seen = set()
+    kept, groups = [], {}
+    for q in queries:
+        c = canonicalize(q)
+        if c in seen:
+            # attach to first representative for that canonical form
+            for rep in kept:
+                if canonicalize(rep) == c:
+                    groups[rep].append(q)
+                    break
+        else:
+            seen.add(c)
+            kept.append(q)
+            groups[q] = [q]
+    return kept, groups
+
+def dedupe_token_set(queries, min_ratio=92):
+    kept = []
+    groups = {}
+    for q in queries:
+        attached = False
+        for k in kept:
+            score = _token_set_ratio(q, k)
+            if score >= min_ratio:
+                groups[k].append(q)
+                attached = True
+                break
+        if not attached:
+            kept.append(q)
+            groups[q] = [q]
+    return kept, groups
+
+def get_embeddings(queries, model="text-embedding-3-small"):
+    resp = openai.embeddings.create(model=model, input=queries)
+    data = getattr(resp, "data", None) or resp["data"]
+    out = []
+    for d in data:
+        emb = getattr(d, "embedding", None)
+        if emb is None:
+            emb = d.get("embedding", [])
+        out.append(np.array(emb, dtype=float))
+    return out
+
+def cosine(a, b):
+    na = np.linalg.norm(a); nb = np.linalg.norm(b)
+    if na == 0 or nb == 0: return 0.0
+    return float(np.dot(a, b) / (na * nb))
+
+def dedupe_embeddings(queries, threshold=0.86, model="text-embedding-3-small"):
+    if not queries:
+        return [], {}
+    try:
+        vecs = get_embeddings(queries, model=model)
+    except Exception as e:
+        st.warning(f"Embedding dedupe skipped (embedding error): {e}")
+        return queries, {q: [q] for q in queries}
+    kept, groups, removed = [], {}, set()
+    for i, qi in enumerate(queries):
+        if i in removed: continue
+        kept.append(qi)
+        groups[qi] = [qi]
+        for j in range(i+1, len(queries)):
+            if j in removed: continue
+            sim = cosine(vecs[i], vecs[j])
+            if sim >= threshold:
+                groups[qi].append(queries[j])
+                removed.add(j)
+    return kept, groups
+
+def dedupe_pipeline(
+    queries,
+    use_exact=True,
+    fuzzy_ratio=92,
+    use_embed=True,
+    embed_threshold=0.86,
+    embed_model="text-embedding-3-small"
+):
+    if not queries:
+        return [], {}
+    q = queries[:]
+
+    # 1) exact canonical
+    if use_exact:
+        q, groups_exact = dedupe_exact(q)
+    else:
+        groups_exact = {x: [x] for x in q}
+
+    # 2) token-set
+    q2, groups_ts = dedupe_token_set(q, min_ratio=fuzzy_ratio)
+
+    # Merge exact groups into token-set reps
+    merged_ts = {rep: [] for rep in q2}
+    for rep in q2:
+        merged_ts[rep].extend(groups_ts[rep])
+
+    # 3) embeddings
+    if use_embed and len(q2) > 1:
+        reps, sem_groups = dedupe_embeddings(q2, threshold=embed_threshold, model=embed_model)
+        final_groups = {r: [] for r in reps}
+        for r in reps:
+            for member in sem_groups[r]:
+                final_groups[r].extend(merged_ts.get(member, [member]))
+        # unique + preserve order
+        for r in final_groups:
+            seen, ded = set(), []
+            for item in final_groups[r]:
+                if item not in seen:
+                    seen.add(item); ded.append(item)
+            final_groups[r] = ded
+        return reps, final_groups
+
+    return q2, merged_ts
+
 # --- Helper: Fetch Fan-Out Queries via Gemini ---
+from requests.exceptions import ReadTimeout
+
 def fetch_query_fan_outs_multi(text, attempts=1, temp=0.0):
     """
     Generate fan-out queries via Gemini, with retries on ReadTimeout.
+    text: input text to expand
+    attempts: how many separate calls to make
+    temp: temperature for generation
     """
     queries = []
     for attempt_i in range(attempts):
@@ -208,13 +337,13 @@ def build_prompt(h1, headings, body, queries):
     ]
     for lvl, txt in headings:
         lines.append(f"- {lvl}: {txt}")
-    lines += ["", "Page Body Text:", body[:BODY_CHAR_LIMIT], "", "Queries to check coverage:"]
+    lines += ["", "Page Body Text:", body[:2000], "", "Queries to check coverage:"]
     for q in queries:
         lines.append(f"- {q}")
     lines += [
-        "",
+        "", 
         "Please provide coverage entries for *all* of the above queries, even if covered=false.",
-        "",
+        "", 
         "Given the above headings and body text, return ONLY a JSON array with keys:",
         "query (string), covered (true/false), explanation (string).",
         "Example: [{\"query\":\"...\",\"covered\":true,\"explanation\":\"...\"}]"
@@ -270,33 +399,40 @@ if st.button("Start Audit") and urls and not st.session_state.processed:
             continue
 
         # Level 1 fan-out
-        lvl1 = st.session_state.h1_fanout_cache.get(h1_text) or fetch_query_fan_outs_multi(
-            h1_text, attempts, gemini_temp
-        )
+        lvl1 = st.session_state.h1_fanout_cache.get(h1_text) or fetch_query_fan_outs_multi(h1_text, attempts, gemini_temp)
         st.session_state.h1_fanout_cache[h1_text] = lvl1
 
         # Level 2 fan-out
         all_qs = []
         for q in lvl1:
-            sub = st.session_state.fanout_layer2_cache.get(q) or fetch_query_fan_outs_multi(
-                q, attempts, gemini_temp
-            )
+            sub = st.session_state.fanout_layer2_cache.get(q) or fetch_query_fan_outs_multi(q, attempts, gemini_temp)
             st.session_state.fanout_layer2_cache[q] = sub
             all_qs.extend(sub)
         all_qs = lvl1 + all_qs
-
-        # Normalize queries by stripping trailing years (optional)
-        if normalize_year_suffix:
-            all_qs = [strip_trailing_years(q) for q in all_qs]
-            # drop any accidental empties after stripping
-            all_qs = [q for q in all_qs if q]
 
         if not all_qs:
             st.warning(f"Skipped {url}: no queries generated.")
             st.session_state.skipped.append({"Address": url, "Reason": "No queries generated"})
             continue
 
-        prompt = build_prompt(h1_text, headings, body, all_qs)
+        # --- Dedupe (optional) ---
+        raw_queries = all_qs[:]  # keep a copy for transparency
+        if enable_dedupe:
+            reps, groups = dedupe_pipeline(
+                all_qs,
+                use_exact=True,
+                fuzzy_ratio=fuzzy_ratio,
+                use_embed=embed_on,
+                embed_threshold=embed_threshold,
+                embed_model=embed_model
+            )
+            queries_for_prompt = reps
+            grouped_view = {rep: "; ".join(members) for rep, members in groups.items()}
+        else:
+            queries_for_prompt = raw_queries
+            grouped_view = {q: q for q in raw_queries}
+
+        prompt = build_prompt(h1_text, headings, body, queries_for_prompt)
         results = get_explanations(prompt, temperature=gpt_temp)
         if not results:
             st.warning(f"Skipped {url}: OpenAI returned no usable output.")
@@ -305,7 +441,12 @@ if st.button("Start Audit") and urls and not st.session_state.processed:
 
         covered = sum(1 for r in results if r.get("covered"))
         pct = int((covered / len(results)) * 100)
-        st.session_state.summary.append({"Address": url, "Fan-out Count": len(all_qs), "Coverage (%)": pct})
+        st.session_state.summary.append({
+            "Address": url,
+            "Fan-out Count (raw)": len(raw_queries),
+            "Queries Used (after dedupe)": len(queries_for_prompt),
+            "Coverage (%)": pct
+        })
         missing = [r.get("query") for r in results if not r.get("covered")]
         st.session_state.actions.append({"Address": url, "Recommended Sections to Add": "; ".join(missing)})
 
@@ -313,8 +454,12 @@ if st.button("Start Audit") and urls and not st.session_state.processed:
             "Address": url,
             "H1": h1_text,
             "Headings": " | ".join(f"{l}:{t}" for l, t in headings),
-            "All Queries": "; ".join(all_qs)  # (normalized list used for GPT)
+            "All Queries (raw)": "; ".join(raw_queries),
+            "Queries Used (final)": "; ".join(queries_for_prompt),
         }
+        if enable_dedupe:
+            row["Dedupe Groups"] = " || ".join([f"{rep} => {members}" for rep, members in grouped_view.items()])
+
         for i, r in enumerate(results, start=1):
             row[f"Query {i}"]       = r.get("query")
             row[f"Covered {i}"]     = r.get("covered")
@@ -346,6 +491,7 @@ if st.session_state.processed:
     if st.session_state.skipped:
         st.subheader("Skipped URLs & Reasons")
         st.table(pd.DataFrame(st.session_state.skipped))
+
 
 
 
