@@ -488,6 +488,32 @@ def _coerce_summary_frame(rows):
     df = df[cols].applymap(_sanitize_for_sheets)
     return df
 
+def _coerce_actions_frame(rows):
+    """Return a 2-col Sheets-safe frame: Address, Recommended sections to add.
+       Merges legacy key casing ('Recommended Sections to Add') into the new key."""
+    cols = ["Address", "Recommended sections to add"]
+    if not rows:
+        return pd.DataFrame(columns=cols)
+
+    df = pd.DataFrame(rows)
+
+    legacy_col = "Recommended Sections to Add"
+    new_col = "Recommended sections to add"
+
+    if new_col not in df.columns and legacy_col in df.columns:
+        df[new_col] = df[legacy_col]
+    elif new_col in df.columns and legacy_col in df.columns:
+        df[new_col] = df[new_col].fillna(df[legacy_col])
+
+    if "Address" not in df.columns:
+        df["Address"] = pd.NA
+    if new_col not in df.columns:
+        df[new_col] = ""
+
+    df = df[["Address", new_col]]
+    df = df.applymap(_sanitize_for_sheets)
+    return df
+
 # =========================
 # MAIN AUDIT LOOP (no cloud, no sidebar)
 # =========================
@@ -660,10 +686,7 @@ if st.session_state.processed:
 
     if st.session_state.actions:
         st.subheader("Actions")
-        # Ensure exactly two columns in the CSV (Address, Recommended sections to add)
-        df_actions = pd.DataFrame(st.session_state.actions)[["Address", "Recommended sections to add"]]
-        # Optional: sanitize to prevent formula-injection if these land in Sheets
-        df_actions = df_actions.applymap(_sanitize_for_sheets)
+        df_actions = _coerce_actions_frame(st.session_state.actions)
 
         st.download_button(
             "Download Actions CSV (Google Sheets)",
@@ -677,6 +700,7 @@ if st.session_state.processed:
     if st.session_state.skipped:
         st.subheader("Skipped URLs & Reasons")
         st.table(pd.DataFrame(st.session_state.skipped))
+
 
 
 
