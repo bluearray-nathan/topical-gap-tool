@@ -17,6 +17,7 @@ import openai
 from requests.exceptions import ReadTimeout
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+import csv
 
 # Optional fuzzy matching (RapidFuzz). Falls back to a simple Jaccard if unavailable.
 try:
@@ -29,14 +30,34 @@ except Exception:
 st.set_page_config(page_title="AI Overview/AI Mode query fan-out gap analysis", layout="wide")
 st.title("🔍 AI Overview/AI Mode Query Fan-Out Gap Analysis")
 
-st.write(
+# --- BEFORE YOU START PANEL ---
+st.markdown(
     """
-This tool identifies content gaps by:
-1) Extracting your page's H1, headings, and body text.  
-2) Generating user query fan-outs for the H1 (Gemini).  
-3) Doing a second-level fan-out on those queries.  
-4) Comparing all queries against the page content to find missing topics.
-"""
+    ### 🛠 Before You Start
+
+    **What this tool does**  
+    1. **Scan your content** – Analyzes each page’s headings and body copy to map your current coverage.  
+    2. **Generate AI-powered queries** – Uses Google’s Gemini with Google Search grounding (the same tech behind AI Overviews & AI Mode) to create multi-layer “fan-out” queries that reflect how AI explores a topic.  
+    3. **Pinpoint coverage gaps** – Compares those queries against your page to reveal exactly what’s missing.  
+    4. **Score your coverage** – Calculates a coverage percentage showing how well your content meets AI-driven search intent.  
+    5. **Give you ready-to-add improvements** – Outputs section ideas you can drop into your content to align with what Google’s AI actually surfaces—boosting visibility, authority, and user trust.  
+
+    **How to run it**  
+    - Paste in **one or more URLs** (one per line) into the text area.  
+    - Click **Start Audit**.  
+    - **Keep the browser tab active** – don’t let your device sleep or the session pause while it’s running.  
+
+    **How long it takes**  
+    - Expect around **60–120 seconds per URL** depending on page size and connection speed.  
+    - Multiple URLs run sequentially, so larger batches will take proportionally longer.  
+
+    **What you’ll get**  
+    - **Detailed results** – Every query, whether it’s covered, plus explanations.  
+    - **Summary view** – Overall coverage % and fan-out query stats.  
+    - **Action list** – Specific sections or topics to add for stronger AI search performance.  
+    - **Downloadable CSVs** – Detailed, Summary, and Actions for editing, sharing, or importing into your workflow.  
+    """,
+    unsafe_allow_html=True
 )
 
 # --- Fixed Configuration (all defaults, no UI controls) ---
@@ -314,7 +335,6 @@ def fetch_query_fan_outs_multi(text, attempts=1, temp=0.0, cand_count=None, time
     return queries
 
 # Parallel Level-2 expansion
-
 def expand_level2_parallel(level1, attempts=1, temp=0.4, max_workers=6, cand_count=4, timeout_s=15):
     results = []
     if not level1:
@@ -432,6 +452,41 @@ def get_explanations_batched(h1, headings, body, queries, batch_size=8, temperat
         prompt = build_prompt(h1, headings, body, group)
         out.extend(get_explanations(prompt, temperature=temperature))
     return out
+
+# =========================
+# GOOGLE SHEETS–FRIENDLY CSV HELPERS
+# =========================
+
+_SHEETS_RISK_PREFIXES = ("=", "+", "-", "@", "\t")
+
+def _sanitize_for_sheets(val):
+    """
+    Prevent formula-injection in Google Sheets by prefixing risky leading chars with a single quote.
+    Convert NaNs to empty strings. Preserve numbers.
+    """
+    if pd.isna(val):
+        return ""
+    if isinstance(val, (int, float, np.number)):
+        return val
+    s = str(val)
+    if s.startswith(_SHEETS_RISK_PREFIXES):
+        return "'" + s
+    return s
+
+def _coerce_summary_frame(rows):
+    """Normalize & order summary columns for clean Sheets import."""
+    cols = ["Address", "Fan-out Count (raw)", "Queries Used (after dedupe)", "Coverage (%)"]
+    if not rows:
+        return pd.DataFrame(columns=cols)
+    df = pd.DataFrame(rows)
+    for c in cols:
+        if c not in df.columns:
+            df[c] = pd.NA
+    df["Address"] = df["Address"].astype("string")
+    for c in ["Fan-out Count (raw)", "Queries Used (after dedupe)", "Coverage (%)"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce").astype("Int64")
+    df = df[cols].applymap(_sanitize_for_sheets)
+    return df
 
 # =========================
 # MAIN AUDIT LOOP (no cloud, no sidebar)
@@ -571,24 +626,53 @@ if start_clicked and urls_ui and not st.session_state.processed:
 # --- Display / Download Results ---
 if st.session_state.processed:
     st.header("Results")
+
     if st.session_state.detailed:
         st.subheader("Detailed")
         df = pd.DataFrame(st.session_state.detailed)
-        st.download_button("Download Detailed CSV", df.to_csv(index=False).encode("utf-8"), "detailed.csv", "text/csv")
+        st.download_button(
+            "Download Detailed CSV",
+            df.to_csv(index=False).encode("utf-8"),
+            "detailed.csv",
+            "text/csv"
+        )
         st.dataframe(df)
+
     if st.session_state.summary:
         st.subheader("Summary")
-        df = pd.DataFrame(st.session_state.summary)
-        st.download_button("Download Summary CSV", df.to_csv(index=False).encode("utf-8"), "summary.csv", "text/csv")
-        st.dataframe(df)
+        df_summary = _coerce_summary_frame(st.session_state.summary)
+
+        # CSV tuned for Google Sheets (UTF-8, comma delimiter, Unix newlines, safe cell sanitization)
+        csv_bytes = df_summary.to_csv(
+            index=False,
+            lineterminator="\n",
+            quoting=csv.QUOTE_MINIMAL
+        ).encode("utf-8")
+
+        st.download_button(
+            "Download Summary CSV (Google Sheets)",
+            csv_bytes,
+            file_name="summary.csv",
+            mime="text/csv"
+        )
+
+        st.dataframe(df_summary)
+
     if st.session_state.actions:
         st.subheader("Actions")
         df = pd.DataFrame(st.session_state.actions)
-        st.download_button("Download Actions CSV", df.to_csv(index=False).encode("utf-8"), "actions.csv", "text/csv")
+        st.download_button(
+            "Download Actions CSV",
+            df.to_csv(index=False).encode("utf-8"),
+            "actions.csv",
+            "text/csv"
+        )
         st.dataframe(df)
+
     if st.session_state.skipped:
         st.subheader("Skipped URLs & Reasons")
         st.table(pd.DataFrame(st.session_state.skipped))
+
 
 
 
