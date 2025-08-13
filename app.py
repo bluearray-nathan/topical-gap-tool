@@ -36,11 +36,11 @@ st.markdown(
     ### 🛠 Before You Start
 
     **What this tool does**  
-    1. **Scan your content** – Analyses each page’s headings and body copy to map your current coverage.  
-    2. **Generate AI-powered queries** – Uses Google’s Gemini with Google Search grounding (the same tech behind AI Overviews & AI Mode) to create multi-layer 'fan-out' queries that reflect how AI explores a topic.  
+    1. **Scan your content** – Analyzes each page’s headings and body copy to map your current coverage.  
+    2. **Generate AI-powered queries** – Uses Google’s Gemini with Google Search grounding (the same tech behind AI Overviews & AI Mode) to create multi-layer “fan-out” queries that reflect how AI explores a topic.  
     3. **Pinpoint coverage gaps** – Compares those queries against your page to reveal exactly what’s missing.  
     4. **Score your coverage** – Calculates a coverage percentage showing how well your content meets AI-driven search intent.  
-    5. **Give you ready-to-add improvements** – Outputs section ideas you can drop into your content to align with what Google’s AI actually surfaces—boosting visibility & authority.  
+    5. **Give you ready-to-add improvements** – Outputs section ideas you can drop into your content to align with what Google’s AI actually surfaces—boosting visibility, authority, and user trust.  
 
     **How to run it**  
     - Paste in **one or more URLs** (one per line) into the text area.  
@@ -416,7 +416,7 @@ def build_prompt(h1, headings, body, queries):
         "",
         "Given the above headings and body text, return ONLY a JSON array with keys:",
         "query (string), covered (true/false), explanation (string).",
-        "Example: [{\"query\":\"...\",\"covered\":true,\"explanation\":\"...\"}]"
+        'Example: [{"query":"...","covered":true,"explanation":"..."}]'
     ]
     return "\n".join(lines)
 
@@ -507,10 +507,8 @@ if start_clicked and urls_ui and not st.session_state.processed:
 
     for idx, url in enumerate(urls_ui):
 
-        elapsed = time.time() - start_time
-        denom = max(1, idx + 1)
-        eta = int((elapsed/denom) * (total - idx))
-        status_text.text(f"Processing {idx+1}/{total} — ETA: {eta}s")
+        # Simple status (ETA removed)
+        status_text.text(f"Processing {idx+1}/{total}")
         progress_bar.progress(int(((idx+1) / total) * 100))
 
         # Content extraction (cached, fast-path first)
@@ -598,10 +596,12 @@ if start_clicked and urls_ui and not st.session_state.processed:
             "Coverage (%)": pct
         }
         st.session_state.summary.append(summary_row)
+
+        # Build "Actions" row with EXACTLY two columns, comma-separated list in one cell
         missing = [r.get("query") for r in results if not r.get("covered")]
         actions_row = {
             "Address": url,
-            "Recommended Sections to Add": "; ".join(missing)
+            "Recommended sections to add": ", ".join(missing)  # single cell, comma-separated
         }
         st.session_state.actions.append(actions_row)
 
@@ -660,18 +660,24 @@ if st.session_state.processed:
 
     if st.session_state.actions:
         st.subheader("Actions")
-        df = pd.DataFrame(st.session_state.actions)
+        # Ensure exactly two columns in the CSV (Address, Recommended sections to add)
+        df_actions = pd.DataFrame(st.session_state.actions)[["Address", "Recommended sections to add"]]
+        # Optional: sanitize to prevent formula-injection if these land in Sheets
+        df_actions = df_actions.applymap(_sanitize_for_sheets)
+
         st.download_button(
-            "Download Actions CSV",
-            df.to_csv(index=False).encode("utf-8"),
+            "Download Actions CSV (Google Sheets)",
+            df_actions.to_csv(index=False, lineterminator="\n", quoting=csv.QUOTE_MINIMAL).encode("utf-8"),
             "actions.csv",
             "text/csv"
         )
-        st.dataframe(df)
+
+        st.dataframe(df_actions)
 
     if st.session_state.skipped:
         st.subheader("Skipped URLs & Reasons")
         st.table(pd.DataFrame(st.session_state.skipped))
+
 
 
 
