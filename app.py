@@ -36,11 +36,11 @@ st.markdown(
     ### 🛠 Before You Start
 
     **What this tool does**  
-    1. **Scan your content** – Analyzes each page’s headings and body copy to map your current coverage.  
-    2. **Generate AI-powered queries** – Uses Google’s Gemini with Google Search grounding (the same tech behind AI Overviews & AI Mode) to create multi-layer “fan-out” queries that reflect how AI explores a topic.  
+    1. **Scan your content** – Analyses each page’s headings and body copy to map your current coverage.  
+    2. **Generate AI-powered queries** – Uses Google’s Gemini with Google Search grounding (the same tech behind AI Overviews & AI Mode) to create multi-layer 'fan-out' queries that reflect how AI explores a topic.  
     3. **Pinpoint coverage gaps** – Compares those queries against your page to reveal exactly what’s missing.  
     4. **Score your coverage** – Calculates a coverage percentage showing how well your content meets AI-driven search intent.  
-    5. **Give you ready-to-add improvements** – Outputs section ideas you can drop into your content to align with what Google’s AI actually surfaces—boosting visibility, authority, and user trust.  
+    5. **Give you ready-to-add improvements** – Outputs section ideas you can drop into your content to align with what Google’s AI actually surfaces—boosting visibility & authority.  
 
     **How to run it**  
     - Paste in **one or more URLs** (one per line) into the text area.  
