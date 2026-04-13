@@ -485,7 +485,7 @@ def _coerce_summary_frame(rows):
     df["Address"] = df["Address"].astype("string")
     for c in ["Fan-out Count (raw)", "Queries Used (after dedupe)", "Coverage (%)"]:
         df[c] = pd.to_numeric(df[c], errors="coerce").astype("Int64")
-    df = df[cols].applymap(_sanitize_for_sheets)
+    df = df[cols].map(_sanitize_for_sheets)
     return df
 
 def _coerce_actions_frame(rows):
@@ -511,7 +511,7 @@ def _coerce_actions_frame(rows):
         df[new_col] = ""
 
     df = df[["Address", new_col]]
-    df = df.applymap(_sanitize_for_sheets)
+    df = df.map(_sanitize_for_sheets)
     return df
 
 # =========================
