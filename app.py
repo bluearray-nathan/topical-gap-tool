@@ -174,6 +174,16 @@ country = st.selectbox(
     help="Grounding searches and generated queries will be focused on this country.",
 )
 
+max_queries = st.slider(
+    "Max queries per URL:",
+    min_value=5,
+    max_value=40,
+    value=15,
+    step=1,
+    help="Upper limit on fan-out queries analysed per URL (after dedupe). "
+         "Lower = broader, more actionable recommendations. Higher = more granular coverage.",
+)
+
 # --- Style the Start Button ---
 st.markdown(
     """
@@ -423,6 +433,10 @@ def fetch_query_fan_outs_multi(text, attempts=1, temp=0.0, cand_count=None, time
             f"You MUST call google_search — do NOT answer the input directly from your own knowledge, "
             f"do NOT write guides, explanations, or prose responses. "
             f"Only perform searches so the grounding metadata contains the fan-out queries. "
+            f"Return between 4 and 6 broad, distinct queries that each cover a different angle of the topic. "
+            f"Do NOT return highly granular variations that only differ by brand/model name "
+            f"(e.g. avoid separate queries for every EV manufacturer when one generic query covers the same intent). "
+            f"Prefer broader searches that represent content gaps at the section level, not the bullet level. "
             f"Treat {country} as the IMPLICIT location context for each search — do NOT include "
             f"'{country}', country abbreviations (e.g. 'UK', 'US', 'USA', 'GB'), city names, "
             f"or region names as literal keywords inside the search queries. "
@@ -776,6 +790,11 @@ if start_clicked and urls_ui and not st.session_state.processed:
         else:
             queries_for_prompt = raw_queries
             grouped_view = {q: q for q in raw_queries}
+
+        # --- Cap total queries at user-selected maximum ---
+        if len(queries_for_prompt) > max_queries:
+            queries_for_prompt = queries_for_prompt[:max_queries]
+            grouped_view = {q: grouped_view.get(q, q) for q in queries_for_prompt}
 
         # Build prompt & call GPT (batched)
         results = get_explanations_batched(
