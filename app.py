@@ -245,6 +245,35 @@ def strip_trailing_years(q: str, min_year: int = 2000, max_year: int | None = No
         return q[:m.start()].rstrip()
     return q
 
+
+# Standalone country/region tokens that should be stripped from queries (real users don't type them)
+GEO_TOKENS_RE = re.compile(
+    r"\b(uk|u\.k\.|gb|gbr|great britain|britain|united kingdom|"
+    r"us|u\.s\.|usa|u\.s\.a\.|united states|america|"
+    r"ca|can|canada|"
+    r"au|aus|australia|"
+    r"ie|ireland|"
+    r"nz|new zealand|"
+    r"de|germany|deutschland|"
+    r"fr|france|"
+    r"es|spain|espana|españa|"
+    r"it|italy|italia|"
+    r"nl|netherlands|holland|"
+    r"za|south africa|"
+    r"in|india|"
+    r"uae|united arab emirates|"
+    r"sg|singapore)\b",
+    re.IGNORECASE,
+)
+
+
+def strip_geo_tokens(q: str) -> str:
+    """Remove standalone country/region tokens from a query and tidy whitespace."""
+    cleaned = GEO_TOKENS_RE.sub("", q)
+    # Collapse double spaces & tidy punctuation/whitespace
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" -,")
+    return cleaned
+
 # =========================
 # DEDUPE UTILITIES
 # =========================
@@ -435,7 +464,7 @@ def fetch_query_fan_outs_multi(text, attempts=1, temp=0.0, cand_count=None, time
             data = resp_json.get("candidates", [])
             found_any = False
             for cand in data:
-                # Try multiple known response shapes (Gemini 2.x vs 3.x, camelCase vs snake_case)
+                # Path 1 (Gemini 2.x): queries in groundingMetadata.webSearchQueries (auto-executed grounding)
                 gm = cand.get("groundingMetadata") or cand.get("grounding_metadata") or {}
                 web_qs = (
                     gm.get("webSearchQueries")
@@ -446,8 +475,18 @@ def fetch_query_fan_outs_multi(text, attempts=1, temp=0.0, cand_count=None, time
                 if web_qs:
                     found_any = True
                     queries.extend(web_qs)
+
+                # Path 2 (Gemini 3): queries returned as functionCall.args.queries
+                parts = cand.get("content", {}).get("parts", []) or []
+                for part in parts:
+                    fc = part.get("functionCall") or part.get("function_call") or {}
+                    if fc.get("name") == "google_search":
+                        fc_qs = (fc.get("args") or {}).get("queries") or []
+                        if fc_qs:
+                            found_any = True
+                            queries.extend(fc_qs)
             if not found_any:
-                # Log response structure (truncated) so we can see what Gemini 3 actually returned
+                # Log response structure (truncated) so we can see what Gemini actually returned
                 preview = json.dumps(resp_json, indent=2)[:1500]
                 st.warning(f"No grounding queries in response for '{text}'. Raw response preview:\n{preview}")
         except Exception as e:
@@ -710,6 +749,10 @@ if start_clicked and urls_ui and not st.session_state.processed:
         if NORMALIZE_YEAR_SUFFIX:
             all_qs = [strip_trailing_years(q) for q in all_qs]
             all_qs = [q for q in all_qs if q]
+
+        # Strip standalone country/region tokens (e.g. "solar panels uk" -> "solar panels")
+        all_qs = [strip_geo_tokens(q) for q in all_qs]
+        all_qs = [q for q in all_qs if q]
 
         if not all_qs:
             reason = "No queries generated"
