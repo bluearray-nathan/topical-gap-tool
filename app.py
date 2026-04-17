@@ -52,11 +52,14 @@ st.markdown(
     - Expect around **60–120 seconds per URL** depending on page size and connection speed.  
     - Multiple URLs run sequentially, so larger batches will take proportionally longer.  
 
-    **What you’ll get**  
-    - **Detailed results** – Every query, whether it’s covered, plus explanations.  
-    - **Summary view** – Overall coverage % and fan-out query stats.  
-    - **Action list** – Specific sections or topics to add for stronger AI search performance.  
-    - **Downloadable CSVs** – Detailed, Summary, and Actions for editing, sharing, or importing into your workflow.  
+    **What you’ll get**
+    - **Detailed results** – Every query, whether it’s covered, plus explanations.
+    - **Summary view** – Overall coverage % and fan-out query stats.
+    - **Action list** – Specific sections or topics to add for stronger AI search performance.
+    - **Downloadable CSVs** – Detailed, Summary, and Actions for editing, sharing, or importing into your workflow.
+
+    **⚠️ Note on country targeting**
+    The **Target country** selector steers Gemini toward your chosen market (language, currency, brands, regulations, etc.), but it isn’t a hard geographic lock — Google’s grounding search doesn’t expose a strict country filter. For most topics the results will be accurately localised, but on subjects with heavy cross-border coverage (e.g. global tech brands, international news, US-dominated content), occasional bleed-through of other countries’ results is possible. Always sanity-check the generated queries before acting on them.
     """,
     unsafe_allow_html=True
 )
@@ -144,6 +147,31 @@ def get_playwright_proxy_settings():
 urls_input = st.text_area(
     "Enter one URL per line to audit:",
     placeholder="https://example.com/page1\nhttps://example.com/page2"
+)
+
+# --- Country Selector ---
+COUNTRIES = [
+    "United Kingdom",
+    "United States",
+    "Canada",
+    "Australia",
+    "Ireland",
+    "New Zealand",
+    "Germany",
+    "France",
+    "Spain",
+    "Italy",
+    "Netherlands",
+    "South Africa",
+    "India",
+    "United Arab Emirates",
+    "Singapore",
+]
+country = st.selectbox(
+    "Target country:",
+    COUNTRIES,
+    index=0,
+    help="Grounding searches and generated queries will be focused on this country.",
 )
 
 # --- Style the Start Button ---
@@ -351,7 +379,7 @@ def dedupe_pipeline(
 # FETCH FAN-OUTS (parametrized + retries)
 # =========================
 
-def fetch_query_fan_outs_multi(text, attempts=1, temp=0.0, cand_count=None, timeout_s=60):
+def fetch_query_fan_outs_multi(text, attempts=1, temp=0.0, cand_count=None, timeout_s=60, country="United Kingdom"):
     """Generate fan-out queries via Gemini, with retries on ReadTimeout."""
     cand = cand_count if cand_count is not None else candidate_count
     queries = []
@@ -360,11 +388,22 @@ def fetch_query_fan_outs_multi(text, attempts=1, temp=0.0, cand_count=None, time
             f"https://generativelanguage.googleapis.com/v1beta/models/"
             f"gemini-3-flash-preview:generateContent?key={gemini_api_key}"
         )
+        system_text = (
+            f"You are generating search queries for a {country} audience. "
+            f"All grounding searches and generated queries MUST be {country}-focused: "
+            f"use the locally appropriate language/spelling, {country} regulations, "
+            f"{country} pricing in local currency, {country} providers/brands/suppliers, "
+            f"and {country}-specific context. "
+            f"Do NOT include topics, legislation, brands, pricing, or regulatory bodies "
+            f"specific to other countries. "
+            f"If the topic has multiple geographic angles, only return the {country} angle."
+        )
         # Gemini 3 Pro only supports candidateCount=1; emulate multi-candidate via attempts loop
         payload = {
             "contents": [{"parts": [{"text": text}]}],
             "tools": [{"google_search": {}}],
             "generationConfig": {"temperature": temp, "candidateCount": 1},
+            "systemInstruction": {"parts": [{"text": system_text}]},
         }
         response = None
         for retry in range(2):
@@ -410,13 +449,13 @@ def fetch_query_fan_outs_multi(text, attempts=1, temp=0.0, cand_count=None, time
     return queries
 
 # Parallel Level-2 expansion
-def expand_level2_parallel(level1, attempts=1, temp=0.4, max_workers=6, cand_count=4, timeout_s=15):
+def expand_level2_parallel(level1, attempts=1, temp=0.4, max_workers=6, cand_count=4, timeout_s=15, country="United Kingdom"):
     results = []
     if not level1:
         return results
     with ThreadPoolExecutor(max_workers=min(max_workers, max(1, len(level1)))) as ex:
         futs = {
-            ex.submit(fetch_query_fan_outs_multi, q, attempts, temp, cand_count, timeout_s): q
+            ex.submit(fetch_query_fan_outs_multi, q, attempts, temp, cand_count, timeout_s, country): q
             for q in level1
         }
         for fut in as_completed(futs):
@@ -472,8 +511,8 @@ def cached_extract(url):
     return h1_text, headings, body, None
 
 @st.cache_data(show_spinner=False, ttl=86400)
-def cached_fanouts(text, cand_count, temp, timeout_s):
-    return fetch_query_fan_outs_multi(text, attempts=attempts, temp=temp, cand_count=cand_count, timeout_s=timeout_s)
+def cached_fanouts(text, cand_count, temp, timeout_s, country="United Kingdom"):
+    return fetch_query_fan_outs_multi(text, attempts=attempts, temp=temp, cand_count=cand_count, timeout_s=timeout_s, country=country)
 
 # =========================
 # PROMPT BUILDING + GPT CALL (batched)
@@ -637,14 +676,15 @@ if start_clicked and urls_ui and not st.session_state.processed:
             st.session_state.skipped.append({"Address": url, "Reason": reason})
             continue
 
-        # Level 1 fan-out (cached)
-        lvl1 = st.session_state.h1_fanout_cache.get(h1_text) or cached_fanouts(
-            h1_text, candidate_count, gemini_temp, LVL1_TIMEOUT
+        # Level 1 fan-out (cached) — include country in key so switching countries doesn't serve stale results
+        lvl1_key = (h1_text, country)
+        lvl1 = st.session_state.h1_fanout_cache.get(lvl1_key) or cached_fanouts(
+            h1_text, candidate_count, gemini_temp, LVL1_TIMEOUT, country
         )
-        st.session_state.h1_fanout_cache[h1_text] = lvl1
+        st.session_state.h1_fanout_cache[lvl1_key] = lvl1
 
         # Level 2 fan-out (parallel & lighter)
-        level2_key = ("__lvl2__", h1_text, LVL2_CANDIDATES, LVL2_TIMEOUT)
+        level2_key = ("__lvl2__", h1_text, LVL2_CANDIDATES, LVL2_TIMEOUT, country)
         level2 = st.session_state.fanout_layer2_cache.get(level2_key)
         if level2 is None:
             level2 = expand_level2_parallel(
@@ -653,7 +693,8 @@ if start_clicked and urls_ui and not st.session_state.processed:
                 temp=gemini_temp,
                 max_workers=MAX_WORKERS,
                 cand_count=LVL2_CANDIDATES,
-                timeout_s=LVL2_TIMEOUT
+                timeout_s=LVL2_TIMEOUT,
+                country=country
             )
             st.session_state.fanout_layer2_cache[level2_key] = level2
 
