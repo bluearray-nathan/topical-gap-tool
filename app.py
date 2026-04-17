@@ -360,10 +360,11 @@ def fetch_query_fan_outs_multi(text, attempts=1, temp=0.0, cand_count=None, time
             f"https://generativelanguage.googleapis.com/v1beta/models/"
             f"gemini-3.1-pro-preview:generateContent?key={gemini_api_key}"
         )
+        # Gemini 3 Pro only supports candidateCount=1; emulate multi-candidate via attempts loop
         payload = {
             "contents": [{"parts": [{"text": text}]}],
             "tools": [{"google_search": {}}],
-            "generationConfig": {"temperature": temp, "candidateCount": cand},
+            "generationConfig": {"temperature": temp, "candidateCount": 1},
         }
         response = None
         for retry in range(2):
@@ -374,7 +375,13 @@ def fetch_query_fan_outs_multi(text, attempts=1, temp=0.0, cand_count=None, time
             except ReadTimeout:
                 time.sleep(0.8)
             except Exception as e:
-                st.warning(f"Fan-out fetch failed for '{text}': {e}")
+                body = ""
+                if response is not None:
+                    try:
+                        body = response.text[:500]
+                    except Exception:
+                        pass
+                st.warning(f"Fan-out fetch failed for '{text}': {e}{' — ' + body if body else ''}")
                 break
         if not response:
             continue
