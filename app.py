@@ -386,9 +386,25 @@ def fetch_query_fan_outs_multi(text, attempts=1, temp=0.0, cand_count=None, time
         if not response:
             continue
         try:
-            data = response.json().get("candidates", [])
+            resp_json = response.json()
+            data = resp_json.get("candidates", [])
+            found_any = False
             for cand in data:
-                queries.extend(cand.get("groundingMetadata", {}).get("webSearchQueries", []) or [])
+                # Try multiple known response shapes (Gemini 2.x vs 3.x, camelCase vs snake_case)
+                gm = cand.get("groundingMetadata") or cand.get("grounding_metadata") or {}
+                web_qs = (
+                    gm.get("webSearchQueries")
+                    or gm.get("web_search_queries")
+                    or gm.get("searchQueries")
+                    or []
+                )
+                if web_qs:
+                    found_any = True
+                    queries.extend(web_qs)
+            if not found_any:
+                # Log response structure (truncated) so we can see what Gemini 3 actually returned
+                preview = json.dumps(resp_json, indent=2)[:1500]
+                st.warning(f"No grounding queries in response for '{text}'. Raw response preview:\n{preview}")
         except Exception as e:
             st.warning(f"Error parsing fan-out response JSON for '{text}': {e}")
     return queries
@@ -495,7 +511,7 @@ def get_explanations(prompt, temperature=0.1, max_retries=2):
     for _ in range(max_retries):
         try:
             resp = openai.chat.completions.create(
-                model="gpt-4o", messages=messages, temperature=temperature
+                model="gpt-5.4-mini", messages=messages, temperature=temperature
             )
             text = resp.choices[0].message.content.strip()
             last_resp = text
