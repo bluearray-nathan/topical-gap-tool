@@ -389,14 +389,20 @@ def fetch_query_fan_outs_multi(text, attempts=1, temp=0.0, cand_count=None, time
             f"gemini-3-flash-preview:generateContent?key={gemini_api_key}"
         )
         system_text = (
-            f"You are generating search queries for a {country} audience. "
-            f"All grounding searches and generated queries MUST be {country}-focused: "
-            f"use the locally appropriate language/spelling, {country} regulations, "
-            f"{country} pricing in local currency, {country} providers/brands/suppliers, "
-            f"and {country}-specific context. "
-            f"Do NOT include topics, legislation, brands, pricing, or regulatory bodies "
-            f"specific to other countries. "
-            f"If the topic has multiple geographic angles, only return the {country} angle."
+            f"Your task: use the google_search tool to discover related search queries "
+            f"that real users in {country} would type when researching this topic. "
+            f"You MUST call google_search — do NOT answer the input directly from your own knowledge, "
+            f"do NOT write guides, explanations, or prose responses. "
+            f"Only perform searches so the grounding metadata contains the fan-out queries. "
+            f"Treat {country} as the IMPLICIT location context for each search — do NOT include "
+            f"'{country}', country abbreviations (e.g. 'UK', 'US', 'USA', 'GB'), city names, "
+            f"or region names as literal keywords inside the search queries. "
+            f"Real users searching locally do not type their country in the query; Google infers location. "
+            f"Each search should read like a natural query a local resident would type, "
+            f"using local language/spelling, referencing {country} regulations, pricing in local currency, "
+            f"and {country} providers/brands/suppliers where specific brand/product searches are needed. "
+            f"Do NOT search for topics, legislation, brands, or regulatory bodies specific to other countries. "
+            f"If the topic has multiple geographic angles, search only the {country} angle."
         )
         # Gemini 3 Pro only supports candidateCount=1; emulate multi-candidate via attempts loop
         payload = {
