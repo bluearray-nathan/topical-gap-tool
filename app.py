@@ -358,7 +358,7 @@ def fetch_query_fan_outs_multi(text, attempts=1, temp=0.0, cand_count=None, time
     for _ in range(attempts):
         endpoint = (
             f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"gemini-3.1-pro-preview:generateContent?key={gemini_api_key}"
+            f"gemini-3-flash-preview:generateContent?key={gemini_api_key}"
         )
         # Gemini 3 Pro only supports candidateCount=1; emulate multi-candidate via attempts loop
         payload = {
