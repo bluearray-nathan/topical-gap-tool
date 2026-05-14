@@ -896,6 +896,115 @@ if st.session_state.processed:
         st.table(pd.DataFrame(st.session_state.skipped))
 
 
+# =========================
+# PHRASE FAN-OUT (standalone, no URL/page needed)
+# =========================
+
+st.divider()
+st.header("🔎 Phrase Fan-Out")
+st.markdown(
+    """
+    Generate fan-out queries for any list of phrases — **no URL required**.
+    Useful for keyword research, content ideation, or exploring how Google's AI would
+    expand a seed term. Uses the **Target country** and **Max queries** settings from above.
+    """
+)
+
+phrases_input = st.text_area(
+    "Enter one phrase per line:",
+    placeholder="electric car charging\nsolar panel grants\nbest energy tariff",
+    key="phrases_input",
+)
+
+# Initialise phrase-fan-out session state
+if "phrase_results" not in st.session_state:
+    st.session_state.phrase_results = []
+if "phrase_processed" not in st.session_state:
+    st.session_state.phrase_processed = False
+
+run_phrases = st.button("Generate Fan-Out Queries", key="run_phrases_btn")
+
+if run_phrases:
+    phrases_list = [p.strip() for p in phrases_input.splitlines() if p.strip()]
+    if not phrases_list:
+        st.warning("Please enter at least one phrase.")
+    else:
+        st.session_state.phrase_results = []
+        st.session_state.phrase_processed = False
+        progress = st.progress(0)
+        status = st.empty()
+
+        for i, phrase in enumerate(phrases_list, start=1):
+            status.text(f"Processing {i}/{len(phrases_list)}: {phrase}")
+            try:
+                # Level 1 fan-out
+                lvl1 = cached_fanouts(phrase, candidate_count, gemini_temp, LVL1_TIMEOUT, country)
+                # Level 2 fan-out (parallel)
+                lvl2 = expand_level2_parallel(
+                    lvl1,
+                    attempts=attempts,
+                    temp=gemini_temp,
+                    max_workers=MAX_WORKERS,
+                    cand_count=LVL2_CANDIDATES,
+                    timeout_s=LVL2_TIMEOUT,
+                    country=country,
+                )
+                all_qs = (lvl1 or []) + (lvl2 or [])
+
+                # Apply same normalization as URL audit
+                if NORMALIZE_YEAR_SUFFIX:
+                    all_qs = [strip_trailing_years(q) for q in all_qs]
+                    all_qs = [q for q in all_qs if q]
+                all_qs = [strip_geo_tokens(q) for q in all_qs]
+                all_qs = [q for q in all_qs if q]
+
+                # Dedupe
+                if ENABLE_DEDUPE and all_qs:
+                    reps, _groups = dedupe_pipeline(
+                        all_qs,
+                        use_exact=True,
+                        fuzzy_ratio=FUZZY_RATIO,
+                        use_embed=EMBED_ON,
+                        embed_threshold=EMBED_THRESHOLD,
+                        embed_model=EMBED_MODEL,
+                    )
+                    final_qs = reps
+                else:
+                    # Preserve order while removing exact dupes
+                    seen = set()
+                    final_qs = []
+                    for q in all_qs:
+                        if q.lower() not in seen:
+                            seen.add(q.lower())
+                            final_qs.append(q)
+
+                # Cap at max_queries
+                final_qs = final_qs[:max_queries]
+
+                for q in final_qs:
+                    st.session_state.phrase_results.append({"Phrase": phrase, "Fan-Out Query": q})
+
+            except Exception as e:
+                st.warning(f"Failed to generate fan-out for '{phrase}': {e}")
+
+            progress.progress(i / len(phrases_list))
+
+        status.text("Done.")
+        st.session_state.phrase_processed = True
+
+if st.session_state.phrase_processed and st.session_state.phrase_results:
+    df_phrases = pd.DataFrame(st.session_state.phrase_results)
+    st.subheader("Fan-Out Results")
+    st.dataframe(df_phrases, use_container_width=True)
+    st.download_button(
+        "Download Phrase Fan-Out CSV",
+        df_phrases.to_csv(index=False).encode("utf-8"),
+        "phrase_fanout.csv",
+        "text/csv",
+        key="download_phrase_csv",
+    )
+
+
 
 
 
