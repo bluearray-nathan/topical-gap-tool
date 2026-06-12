@@ -81,14 +81,18 @@ def _fetch_playwright(url):
     return html
 
 
-def fetch_html(url, timeout=20):
-    """Fast path via cloudscraper; fall back to a headless browser for JS pages."""
-    html = None
+def fetch_html(url, timeout=20, need_h1=True):
+    """Fast path via cloudscraper; fall back to a headless browser when needed.
+
+    When need_h1 is False (e.g. competitor pages) we accept whatever the fast path
+    returns rather than forcing the browser, so competitor analysis keeps working
+    even where the browser engine is unavailable.
+    """
     try:
         html = _fetch_fast(url, timeout)
     except Exception:
         html = None
-    if html and re.search(r"<h1[ >]", html, re.I):
+    if html and (not need_h1 or re.search(r"<h1[ >]", html, re.I)):
         return html
     try:
         return _fetch_playwright(url)
@@ -251,15 +255,15 @@ def parse_html(url, html) -> PageContent:
     )
 
 
-def extract_page(url) -> PageContent:
+def extract_page(url, need_h1=True) -> PageContent:
     """Fetch and parse a URL into structured, boilerplate-free content."""
     try:
-        html = fetch_html(url)
+        html = fetch_html(url, need_h1=need_h1)
     except Exception as e:
         return PageContent(url=url, error=_friendly_fetch_error(e))
     return parse_html(url, html)
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
-def cached_extract_page(url) -> PageContent:
-    return extract_page(url)
+def cached_extract_page(url, need_h1=True) -> PageContent:
+    return extract_page(url, need_h1=need_h1)

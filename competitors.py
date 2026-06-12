@@ -75,7 +75,7 @@ def _entity_items(entities):
 
 
 def _score_one(url, items):
-    page = extraction.cached_extract_page(url)
+    page = extraction.cached_extract_page(url, need_h1=False)
     if not page.ok:
         return url, {"ok": False, "error": page.error or "No usable content", "scores": {}}
     results = coverage.score_coverage(page, items)
