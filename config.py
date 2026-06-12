@@ -145,6 +145,8 @@ LVL1_TIMEOUT = 30
 LVL2_CANDIDATES = 4
 LVL2_TIMEOUT = 15
 MAX_WORKERS = 6
+OPENAI_FANOUT_N = 15       # queries requested in a single ChatGPT fan-out call
+OPENAI_FANOUT_TEMP = 0.5
 
 # Coverage scoring
 GPT_TEMP = 0.1

@@ -5,14 +5,20 @@ config so a model rename does not silently break generation.
 """
 
 import json
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import openai
 import requests
 import streamlit as st
 from requests.exceptions import ReadTimeout
 
 import config
+import text_utils
+
+GEMINI = "Gemini"
+OPENAI = "ChatGPT"
 
 
 def _system_instruction(country):
@@ -131,3 +137,141 @@ def cached_fanouts(text, cand_count, temp, timeout_s, country="United Kingdom"):
         text, attempts=config.ATTEMPTS, temp=temp, cand_count=cand_count,
         timeout_s=timeout_s, country=country,
     )
+
+
+# =========================
+# OPENAI (CHATGPT) FAN-OUT
+# =========================
+
+def _openai_fanout_prompt(text, country, n):
+    return (
+        f"You are modelling how an AI search engine fans a topic out into the distinct search "
+        f"queries a real user in {country} would issue while researching it.\n"
+        f"Topic: {text}\n\n"
+        f"Return {n} broad, distinct queries that each cover a different angle or sub-topic. "
+        f"Prefer section-level intents over trivial variations. Do not include the country name "
+        f"or its abbreviations in the queries; assume local context. Use local spelling, currency, "
+        f"brands and regulations where relevant.\n"
+        f"Return ONLY a JSON array of strings."
+    )
+
+
+def _parse_json_array(text):
+    if not text:
+        return []
+    m = re.search(r"\[.*\]", text, flags=re.DOTALL)
+    if not m:
+        return []
+    try:
+        arr = json.loads(m.group(0))
+    except Exception:
+        return []
+    return [q.strip() for q in arr if isinstance(q, str) and q.strip()]
+
+
+def _openai_fanout_grounded(prompt):
+    """Best effort: use the Responses API web_search tool, extract issued queries
+    and any JSON array the model returns. Returns [] if the API is unavailable."""
+    try:
+        resp = openai.responses.create(
+            model=config.openai_model(),
+            tools=[{"type": "web_search"}],
+            input=prompt + "\n\nSearch the web first, then return the JSON array.",
+        )
+    except Exception:
+        return []
+    out = []
+    try:
+        for item in getattr(resp, "output", []) or []:
+            if getattr(item, "type", None) == "web_search_call":
+                action = getattr(item, "action", None)
+                q = getattr(action, "query", None) if action is not None else None
+                if q:
+                    out.append(q)
+    except Exception:
+        pass
+    out.extend(_parse_json_array(getattr(resp, "output_text", "") or ""))
+    seen, ded = set(), []
+    for q in out:
+        k = q.strip().lower()
+        if q.strip() and k not in seen:
+            seen.add(k)
+            ded.append(q.strip())
+    return ded
+
+
+def _openai_fanout_plain(prompt):
+    try:
+        resp = openai.chat.completions.create(
+            model=config.openai_model(),
+            messages=[
+                {"role": "system", "content": "You output ONLY a JSON array of strings."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=config.OPENAI_FANOUT_TEMP,
+        )
+        return _parse_json_array((resp.choices[0].message.content or "").strip())
+    except Exception as e:
+        st.warning(f"ChatGPT fan-out failed: {e}")
+        return []
+
+
+def openai_fanout(text, country="United Kingdom", n=None):
+    """ChatGPT fan-out: grounded via web search where supported, else generated."""
+    n = n or config.OPENAI_FANOUT_N
+    prompt = _openai_fanout_prompt(text, country, n)
+    queries = _openai_fanout_grounded(prompt)
+    if queries:
+        return queries
+    return _openai_fanout_plain(prompt)
+
+
+@st.cache_data(show_spinner=False, ttl=86400)
+def cached_openai_fanout(text, country="United Kingdom", n=None):
+    return openai_fanout(text, country=country, n=n)
+
+
+# =========================
+# DISPATCHER (one or both engines)
+# =========================
+
+def _normalise(q):
+    if config.NORMALIZE_YEAR_SUFFIX:
+        q = text_utils.strip_trailing_years(q)
+    return text_utils.strip_geo_tokens(q).strip()
+
+
+def generate_fanout(seed, country, providers, max_workers=None):
+    """Run the selected fan-out engines and merge.
+
+    Returns (queries, source_map) where source_map maps a lowercased query to the
+    sorted list of engines that produced it (so 'Both' shows overlap).
+    """
+    providers = providers or [GEMINI]
+    max_workers = max_workers or config.MAX_WORKERS
+    merged = {}  # lower -> {"display":.., "sources": set()}
+
+    def add(q, src):
+        q = _normalise(q)
+        if not q:
+            return
+        key = q.lower()
+        entry = merged.setdefault(key, {"display": q, "sources": set()})
+        entry["sources"].add(src)
+
+    if GEMINI in providers:
+        lvl1 = cached_fanouts(seed, config.CANDIDATE_COUNT, config.GEMINI_TEMP, config.LVL1_TIMEOUT, country)
+        lvl2 = expand_level2_parallel(
+            lvl1, attempts=config.ATTEMPTS, temp=config.GEMINI_TEMP, max_workers=max_workers,
+            cand_count=config.LVL2_CANDIDATES, timeout_s=config.LVL2_TIMEOUT, country=country,
+        )
+        for q in (lvl1 or []) + (lvl2 or []):
+            add(q, GEMINI)
+
+    if OPENAI in providers:
+        for q in cached_openai_fanout(seed, country):
+            add(q, OPENAI)
+
+    queries = [v["display"] for v in merged.values()]
+    source_map = {k: sorted(v["sources"]) for k, v in merged.items()}
+    return queries, source_map
