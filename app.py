@@ -24,7 +24,8 @@ config.configure_apis()
 branding.inject_css()
 branding.render_header(
     "AI fan-out gap analysis",
-    "Map your page against the entities and queries Google's AI explores, and against your competitors.",
+    "Map your page against the entities and queries AI search explores, across Google AI Overviews, "
+    "AI Mode and ChatGPT, and against your competitors.",
 )
 
 
@@ -148,7 +149,7 @@ with tab_audit:
         <div class="ba-panel">
         <b>What this does</b><br>
         1. Reads the main content of each page (boilerplate, navigation and footers removed).<br>
-        2. Generates multi-layer fan-out queries the way AI Overviews and AI Mode explore a topic.<br>
+        2. Generates multi-layer fan-out queries the way AI search explores a topic, using Gemini's grounded Google search, ChatGPT, or both.<br>
         3. Clusters those queries into <b>entities</b>: the named things and key subtopics a topic is built from.<br>
         4. Scores how well your page covers each entity (missing, thin or strong) with supporting evidence.<br>
         5. Optionally benchmarks your page against competitors to show which entities they cover and you do not.
@@ -376,8 +377,9 @@ with tab_keyword:
     kw_country, kw_max, kw_providers = _settings_row("kw")
 
     st.markdown(
-        "Enter a topic, such as solar panels, and this pulls in the relevant fan-out queries and "
-        "groups them by entity. No URL required. Useful for keyword research and content planning."
+        "Enter a topic, such as solar panels, and this pulls in the relevant fan-out queries from "
+        "Gemini, ChatGPT, or both, and groups them by entity. No URL required. Useful for keyword "
+        "research and content planning."
     )
 
     phrases_input = st.text_area(
