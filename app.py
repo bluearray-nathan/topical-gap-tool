@@ -81,6 +81,31 @@ def _provider_list(engine_choice):
     return [fanout.GEMINI]
 
 
+def _settings_row(prefix):
+    """Render per-tab country / max queries / engine controls. Returns
+    (country, max_queries, providers)."""
+    c1, c2, c3 = st.columns([1.2, 1, 1.4])
+    with c1:
+        country = st.selectbox(
+            "Target country:", config.COUNTRIES, index=0, key=f"{prefix}_country",
+            help="Grounding searches and generated queries are focused on this country.",
+        )
+    with c2:
+        max_queries = st.slider(
+            "Max queries:", min_value=5, max_value=40, value=15, step=1, key=f"{prefix}_max",
+            help="Upper limit on fan-out queries (after dedupe) per URL or topic.",
+        )
+    with c3:
+        engine = st.radio(
+            "Fan-out engine:",
+            ["Gemini (grounded search)", "ChatGPT", "Both (combine)"],
+            index=0, horizontal=True, key=f"{prefix}_engine",
+            help="Gemini uses live Google Search grounding, which mirrors AI Mode. ChatGPT uses "
+                 "its own web search or generation. Both runs each and merges the queries.",
+        )
+    return country, max_queries, _provider_list(engine)
+
+
 def _fanout_reps(seed, providers, country, max_queries):
     """Generate, dedupe and cap fan-out queries. Returns (raw, reps, groups, source_map)."""
     queries, source_map = fanout.generate_fanout(seed, country, providers)
@@ -107,32 +132,8 @@ def _sources_for(rep, groups, source_map):
     return ", ".join(sorted(s))
 
 
-# =========================
-# SHARED SETTINGS (apply to both tabs)
-# =========================
-
-set_a, set_b, set_c = st.columns([1.2, 1, 1.4])
-with set_a:
-    country = st.selectbox(
-        "Target country:", config.COUNTRIES, index=0,
-        help="Grounding searches and generated queries are focused on this country.",
-    )
-with set_b:
-    max_queries = st.slider(
-        "Max queries:", min_value=5, max_value=40, value=15, step=1,
-        help="Upper limit on fan-out queries (after dedupe) per URL or phrase.",
-    )
-with set_c:
-    engine = st.radio(
-        "Fan-out engine:",
-        ["Gemini (grounded search)", "ChatGPT", "Both (combine)"],
-        index=0, horizontal=True,
-        help="Gemini uses live Google Search grounding, which mirrors AI Mode. ChatGPT uses its "
-             "own web search or generation. Both runs each and merges the queries.",
-    )
-providers = _provider_list(engine)
-
-tab_audit, tab_keyword = st.tabs(["Page gap analysis", "Keyword fan-out"])
+# Tabs are the first thing on the page so neither feature is buried.
+tab_audit, tab_keyword = st.tabs(["Page gap analysis", "Topic fan-out"])
 
 
 # =========================
@@ -140,6 +141,8 @@ tab_audit, tab_keyword = st.tabs(["Page gap analysis", "Keyword fan-out"])
 # =========================
 
 with tab_audit:
+    country, max_queries, providers = _settings_row("audit")
+
     st.markdown(
         """
         <div class="ba-panel">
@@ -370,25 +373,26 @@ with tab_audit:
 # =========================
 
 with tab_keyword:
+    kw_country, kw_max, kw_providers = _settings_row("kw")
+
     st.markdown(
-        "Generate fan-out queries for any list of phrases, no URL required, and see them grouped by "
-        "entity. Useful for keyword research and content planning. Uses the country, max queries and "
-        "fan-out engine settings above."
+        "Enter a topic, such as solar panels, and this pulls in the relevant fan-out queries and "
+        "groups them by entity. No URL required. Useful for keyword research and content planning."
     )
 
     phrases_input = st.text_area(
-        "Enter one phrase per line:",
-        placeholder="electric car charging\nsolar panel grants\nbest energy tariff",
+        "Enter one topic per line:",
+        placeholder="solar panels\nelectric cars\nheat pump grants",
         key="phrases_input",
     )
 
     if "phrase_rows" not in st.session_state:
         st.session_state.phrase_rows = []
 
-    if st.button("Generate fan-out queries", key="run_phrases_btn"):
+    if st.button("Generate topic fan-out", key="run_phrases_btn"):
         phrases = [p.strip() for p in phrases_input.splitlines() if p.strip()]
         if not phrases:
-            st.warning("Please enter at least one phrase.")
+            st.warning("Please enter at least one topic.")
         else:
             st.session_state.phrase_rows = []
             progress = st.progress(0)
@@ -396,15 +400,15 @@ with tab_keyword:
             for i, phrase in enumerate(phrases, start=1):
                 status.text(f"Processing {i}/{len(phrases)}: {phrase}")
                 try:
-                    _raw, reps, groups, source_map = _fanout_reps(phrase, providers, country, max_queries)
+                    _raw, reps, groups, source_map = _fanout_reps(phrase, kw_providers, kw_country, kw_max)
                     if not reps:
                         st.warning(f"No queries generated for '{phrase}'.")
                         continue
-                    ents = entity_mod.cluster_entities(reps, topic=phrase, country=country)
+                    ents = entity_mod.cluster_entities(reps, topic=phrase, country=kw_country)
                     for e in ents:
                         for q in e["queries"]:
                             st.session_state.phrase_rows.append({
-                                "Phrase": phrase,
+                                "Topic": phrase,
                                 "Entity": e["name"],
                                 "Type": e["type"],
                                 "Fan-out query": q,
@@ -416,14 +420,14 @@ with tab_keyword:
             status.text("Done.")
 
     if st.session_state.phrase_rows:
-        st.subheader("Fan-out queries grouped by entity")
+        st.subheader("Topic fan-out grouped by entity")
         df_kw = pd.DataFrame(st.session_state.phrase_rows).sort_values(
-            ["Phrase", "Entity"]
+            ["Topic", "Entity"]
         ).reset_index(drop=True)
         st.dataframe(df_kw, use_container_width=True)
         st.download_button(
-            "Download keyword fan-out CSV", _csv_bytes(_safe(df_kw)),
-            "keyword_fanout_entities.csv", "text/csv", key="dl_kw",
+            "Download topic fan-out CSV", _csv_bytes(_safe(df_kw)),
+            "topic_fanout_entities.csv", "text/csv", key="dl_kw",
         )
 
 branding.render_footer()
