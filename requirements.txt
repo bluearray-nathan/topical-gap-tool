@@ -1,8 +1,12 @@
 # requirements.txt
 streamlit
 pandas
+numpy
 requests
 beautifulsoup4
+lxml
+trafilatura
+rapidfuzz
 openai
 cloudscraper
 playwright
