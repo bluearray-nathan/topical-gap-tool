@@ -152,83 +152,61 @@ def _openai_fanout_prompt(text, country, n):
         f"Prefer section-level intents over trivial variations. Do not include the country name "
         f"or its abbreviations in the queries; assume local context. Use local spelling, currency, "
         f"brands and regulations where relevant.\n"
-        f"Return ONLY a JSON array of strings."
+        f'Respond with JSON only, in the form {{"queries": ["query one", "query two"]}}.'
     )
 
 
-def _parse_json_array(text):
-    if not text:
+def _extract_queries(raw):
+    """Pull query strings from a model response that may be a bare JSON array, an
+    object with a 'queries' list, or text containing one of those."""
+    if not raw:
         return []
-    m = re.search(r"\[.*\]", text, flags=re.DOTALL)
-    if not m:
-        return []
+    blocks = []
     try:
-        arr = json.loads(m.group(0))
+        blocks.append(json.loads(raw))
     except Exception:
-        return []
-    return [q.strip() for q in arr if isinstance(q, str) and q.strip()]
+        for pattern in (r"\{.*\}", r"\[.*\]"):
+            m = re.search(pattern, raw, flags=re.DOTALL)
+            if m:
+                try:
+                    blocks.append(json.loads(m.group(0)))
+                except Exception:
+                    pass
+    for data in blocks:
+        if isinstance(data, list):
+            out = [q.strip() for q in data if isinstance(q, str) and q.strip()]
+            if out:
+                return out
+        if isinstance(data, dict):
+            for key in ("queries", "fan_out", "fanout", "results", "items"):
+                val = data.get(key)
+                if isinstance(val, list):
+                    out = [q.strip() for q in val if isinstance(q, str) and q.strip()]
+                    if out:
+                        return out
+    return []
 
 
-def _openai_fanout_grounded(prompt):
-    """Best effort: use the Responses API web_search tool, extract issued queries
-    and any JSON array the model returns. Returns [] if the API is unavailable."""
-    try:
-        resp = openai.responses.create(
-            model=config.openai_model(),
-            tools=[{"type": "web_search"}],
-            input=prompt + "\n\nSearch the web first, then return the JSON array.",
-        )
-    except Exception:
-        return []
-    out = []
-    try:
-        for item in getattr(resp, "output", []) or []:
-            if getattr(item, "type", None) == "web_search_call":
-                action = getattr(item, "action", None)
-                q = getattr(action, "query", None) if action is not None else None
-                if q:
-                    out.append(q)
-    except Exception:
-        pass
-    out.extend(_parse_json_array(getattr(resp, "output_text", "") or ""))
-    seen, ded = set(), []
-    for q in out:
-        k = q.strip().lower()
-        if q.strip() and k not in seen:
-            seen.add(k)
-            ded.append(q.strip())
-    return ded
-
-
-def _openai_fanout_plain(prompt):
+def openai_fanout(text, country="United Kingdom", n=None):
+    """ChatGPT fan-out via chat completions (model-generated query expansion)."""
+    n = n or config.OPENAI_FANOUT_N
+    prompt = _openai_fanout_prompt(text, country, n)
     try:
         resp = openai.chat.completions.create(
             model=config.openai_model(),
             messages=[
-                {"role": "system", "content": "You output ONLY a JSON array of strings."},
+                {"role": "system", "content": "You output only JSON, no prose."},
                 {"role": "user", "content": prompt},
             ],
-            temperature=config.OPENAI_FANOUT_TEMP,
         )
-        return _parse_json_array((resp.choices[0].message.content or "").strip())
+        raw = (resp.choices[0].message.content or "").strip()
     except Exception as e:
-        st.warning(f"ChatGPT fan-out failed: {e}")
+        st.warning(f"ChatGPT fan-out call failed: {e}")
         return []
-
-
-def openai_fanout(text, country="United Kingdom", n=None):
-    """ChatGPT fan-out: grounded via web search where supported, else generated."""
-    n = n or config.OPENAI_FANOUT_N
-    prompt = _openai_fanout_prompt(text, country, n)
-    queries = _openai_fanout_grounded(prompt)
-    if queries:
-        return queries
-    return _openai_fanout_plain(prompt)
-
-
-@st.cache_data(show_spinner=False, ttl=86400)
-def cached_openai_fanout(text, country="United Kingdom", n=None):
-    return openai_fanout(text, country=country, n=n)
+    queries = _extract_queries(raw)
+    if not queries:
+        st.warning(f"ChatGPT fan-out returned no parseable queries. Raw response: {raw[:300]}")
+    return queries
 
 
 # =========================
@@ -269,7 +247,7 @@ def generate_fanout(seed, country, providers, max_workers=None):
             add(q, GEMINI)
 
     if OPENAI in providers:
-        for q in cached_openai_fanout(seed, country):
+        for q in openai_fanout(seed, country):
             add(q, OPENAI)
 
     queries = [v["display"] for v in merged.values()]
