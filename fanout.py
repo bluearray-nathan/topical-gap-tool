@@ -20,6 +20,20 @@ import text_utils
 GEMINI = "Gemini"
 OPENAI = "ChatGPT"
 
+# Transient HTTP statuses worth retrying with back-off (overload, rate limits).
+_TRANSIENT_STATUS = {429, 500, 502, 503, 504}
+_HTTP_TRIES = 3
+_BACKOFF_BASE = 0.8
+
+
+def _redact(text):
+    """Strip any API key from text before it reaches a warning or log."""
+    s = re.sub(r"(key=)[A-Za-z0-9_\-]+", r"\1REDACTED", str(text))
+    k = config.get_gemini_key()
+    if k:
+        s = s.replace(k, "REDACTED")
+    return s
+
 
 def _system_instruction(country):
     return (
@@ -74,12 +88,14 @@ def _parse_queries(resp_json, text):
 
 def fetch_query_fan_outs_multi(text, attempts=1, temp=0.0, cand_count=None, timeout_s=60,
                                country="United Kingdom"):
-    """Generate fan-out queries via Gemini, retrying on ReadTimeout."""
+    """Generate fan-out queries via Gemini. Retries transient errors (429/5xx) with
+    back-off. The API key is sent as a header so it never appears in a URL or log."""
     queries = []
     endpoint = (
         f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{config.gemini_model()}:generateContent?key={config.get_gemini_key()}"
+        f"{config.gemini_model()}:generateContent"
     )
+    headers = {"x-goog-api-key": config.get_gemini_key() or ""}
     for _ in range(attempts):
         payload = {
             "contents": [{"parts": [{"text": text}]}],
@@ -88,28 +104,31 @@ def fetch_query_fan_outs_multi(text, attempts=1, temp=0.0, cand_count=None, time
             "systemInstruction": {"parts": [{"text": _system_instruction(country)}]},
         }
         response = None
-        for _retry in range(2):
+        last_err = None
+        for attempt_i in range(_HTTP_TRIES):
             try:
-                response = requests.post(endpoint, json=payload, timeout=timeout_s)
-                response.raise_for_status()
+                resp = requests.post(endpoint, json=payload, headers=headers, timeout=timeout_s)
+                if resp.status_code in _TRANSIENT_STATUS:
+                    last_err = f"{resp.status_code} {resp.reason} (transient, retrying)"
+                    time.sleep(_BACKOFF_BASE * (attempt_i + 1))
+                    continue
+                resp.raise_for_status()
+                response = resp
                 break
             except ReadTimeout:
-                time.sleep(0.8)
+                last_err = "read timeout"
+                time.sleep(_BACKOFF_BASE * (attempt_i + 1))
             except Exception as e:
-                body = ""
-                if response is not None:
-                    try:
-                        body = response.text[:500]
-                    except Exception:
-                        pass
-                st.warning(f"Fan-out fetch failed for '{text}': {e}{' — ' + body if body else ''}")
+                last_err = _redact(e)
                 break
-        if not response:
+        if response is None:
+            if last_err:
+                st.warning(f"Fan-out fetch failed for '{text}': {last_err}")
             continue
         try:
             queries.extend(_parse_queries(response.json(), text))
         except Exception as e:
-            st.warning(f"Error parsing fan-out response JSON for '{text}': {e}")
+            st.warning(f"Error parsing fan-out response JSON for '{text}': {_redact(e)}")
     return queries
 
 
