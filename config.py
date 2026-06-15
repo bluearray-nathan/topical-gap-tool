@@ -54,7 +54,7 @@ def gemini_model():
     return (
         _secret_value(("models", "gemini"))
         or os.getenv("GEMINI_MODEL")
-        or "gemini-3-flash-preview"
+        or "gemini-2.5-flash"
     )
 
 
