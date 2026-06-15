@@ -159,51 +159,66 @@ with tab_audit:
     )
     st.write("")
 
-    urls_input = st.text_area(
-        "Enter one URL per line to audit:",
-        placeholder="https://example.com/page1\nhttps://example.com/page2",
+    mode = st.radio(
+        "Audit mode:",
+        ["Single URL", "Multiple URLs"],
+        horizontal=True, key="audit_mode",
+        help="Single URL: deep-dive one page, with a target keyword and competitor benchmarking. "
+             "Multiple URLs: audit a batch of pages at once, each seeded from its own H1.",
     )
-    target_keyword = st.text_input(
-        "Target keyword (optional):",
-        placeholder="e.g. smart export guarantee",
-        help="Seeds the fan-out and competitor discovery. If left blank, the page H1 is used.",
-    )
-    urls = [line.strip() for line in urls_input.splitlines() if line.strip()]
 
-    # --- Competitor setup ---
-    compare_competitors = st.checkbox("Benchmark against competitors", value=False)
-    if compare_competitors:
-        st.caption(
-            "Competitor benchmarking runs for the first URL in the list, using its target keyword "
-            "(or H1). Each competitor adds a fetch and a scoring pass, so more competitors means a "
-            "longer run."
+    if mode == "Single URL":
+        single_url = st.text_input("URL to audit:", placeholder="https://example.com/page")
+        urls = [single_url.strip()] if single_url.strip() else []
+        target_keyword = st.text_input(
+            "Target keyword (optional):",
+            placeholder="e.g. smart export guarantee",
+            help="Seeds the fan-out and competitor discovery. If left blank, the page H1 is used.",
         )
-        if competitors.serpapi_available():
-            if st.button("Suggest competitors from Google", key="suggest_comp"):
-                primary = urls[0] if urls else ""
-                seed = target_keyword.strip()
-                if not seed and primary:
-                    with st.spinner("Reading the page to find a seed keyword..."):
-                        seed = extraction.cached_extract_page(primary).h1
-                if not seed:
-                    st.warning("Enter a target keyword or at least one URL first.")
-                else:
-                    with st.spinner("Finding top organic results..."):
-                        suggestions = competitors.discover_competitors(seed, country, primary)
-                    existing = [u for u in st.session_state.get("competitor_urls_text", "").splitlines() if u.strip()]
-                    merged = list(dict.fromkeys(existing + suggestions))
-                    st.session_state["competitor_urls_text"] = "\n".join(merged)
-                    if not suggestions:
-                        st.info("No competitors returned. Check the keyword, or paste URLs manually below.")
-        else:
+        compare_competitors = st.checkbox("Benchmark against competitors", value=False)
+        if compare_competitors:
             st.caption(
-                "Add a SerpAPI key to the app secrets to enable auto-suggestions. "
-                "You can still paste competitor URLs below."
+                "Benchmarks this page against competitors on the same entities. Each competitor "
+                "adds a fetch and a scoring pass, so more competitors means a longer run."
             )
-        st.text_area(
-            "Competitor URLs (one per line):",
-            key="competitor_urls_text",
-            placeholder="https://competitor-a.com/page\nhttps://competitor-b.com/page",
+            if competitors.serpapi_available():
+                if st.button("Suggest competitors from Google", key="suggest_comp"):
+                    primary = urls[0] if urls else ""
+                    seed = target_keyword.strip()
+                    if not seed and primary:
+                        with st.spinner("Reading the page to find a seed keyword..."):
+                            seed = extraction.cached_extract_page(primary).h1
+                    if not seed:
+                        st.warning("Enter a target keyword or the URL first.")
+                    else:
+                        with st.spinner("Finding top organic results..."):
+                            suggestions = competitors.discover_competitors(seed, country, primary)
+                        existing = [u for u in st.session_state.get("competitor_urls_text", "").splitlines() if u.strip()]
+                        merged = list(dict.fromkeys(existing + suggestions))
+                        st.session_state["competitor_urls_text"] = "\n".join(merged)
+                        if not suggestions:
+                            st.info("No competitors returned. Check the keyword, or paste URLs manually below.")
+            else:
+                st.caption(
+                    "Add a SerpAPI key to the app secrets to enable auto-suggestions. "
+                    "You can still paste competitor URLs below."
+                )
+            st.text_area(
+                "Competitor URLs (one per line):",
+                key="competitor_urls_text",
+                placeholder="https://competitor-a.com/page\nhttps://competitor-b.com/page",
+            )
+    else:
+        urls_input = st.text_area(
+            "Enter one URL per line to audit:",
+            placeholder="https://example.com/page1\nhttps://example.com/page2",
+        )
+        urls = [line.strip() for line in urls_input.splitlines() if line.strip()]
+        target_keyword = ""
+        compare_competitors = False
+        st.caption(
+            "Each page is seeded from its own H1. Target keyword and competitor benchmarking "
+            "are available in Single URL mode."
         )
 
     # --- Session state ---
@@ -219,7 +234,7 @@ with tab_audit:
 
     init_audit_state()
 
-    current_inputs = (tuple(urls), target_keyword.strip(), country, max_queries, tuple(providers))
+    current_inputs = (tuple(urls), target_keyword.strip(), country, max_queries, tuple(providers), mode)
     if st.session_state.last_inputs != current_inputs:
         st.session_state.last_inputs = current_inputs
         st.session_state.processed = False
