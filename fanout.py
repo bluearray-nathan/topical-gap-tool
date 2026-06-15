@@ -219,37 +219,82 @@ def _normalise(q):
     return text_utils.strip_geo_tokens(q).strip()
 
 
-def generate_fanout(seed, country, providers, max_workers=None):
-    """Run the selected fan-out engines and merge.
+def _gemini_layers(seed, country, depth, max_workers):
+    """Grounded fan-out to `depth` layers, deduping between layers so the tree
+    does not explode. Returns normalised queries in breadth-first order."""
+    seen, ordered = set(), []
 
-    Returns (queries, source_map) where source_map maps a lowercased query to the
-    sorted list of engines that produced it (so 'Both' shows overlap).
-    """
-    providers = providers or [GEMINI]
-    max_workers = max_workers or config.MAX_WORKERS
-    merged = {}  # lower -> {"display":.., "sources": set()}
+    def take(qs):
+        added = []
+        for q in qs or []:
+            nq = _normalise(q)
+            if nq and nq.lower() not in seen:
+                seen.add(nq.lower())
+                ordered.append(nq)
+                added.append(nq)
+        return added
 
-    def add(q, src):
-        q = _normalise(q)
-        if not q:
-            return
-        key = q.lower()
-        entry = merged.setdefault(key, {"display": q, "sources": set()})
-        entry["sources"].add(src)
-
-    if GEMINI in providers:
-        lvl1 = cached_fanouts(seed, config.CANDIDATE_COUNT, config.GEMINI_TEMP, config.LVL1_TIMEOUT, country)
-        lvl2 = expand_level2_parallel(
-            lvl1, attempts=config.ATTEMPTS, temp=config.GEMINI_TEMP, max_workers=max_workers,
+    current = take(cached_fanouts(
+        seed, config.CANDIDATE_COUNT, config.GEMINI_TEMP, config.LVL1_TIMEOUT, country
+    ))
+    for _ in range(max(0, depth - 1)):
+        if not current:
+            break
+        expanded = expand_level2_parallel(
+            current, attempts=config.ATTEMPTS, temp=config.GEMINI_TEMP, max_workers=max_workers,
             cand_count=config.LVL2_CANDIDATES, timeout_s=config.LVL2_TIMEOUT, country=country,
         )
-        for q in (lvl1 or []) + (lvl2 or []):
-            add(q, GEMINI)
+        current = take(expanded)
+    return ordered
 
-    if OPENAI in providers:
-        for q in openai_fanout(seed, country):
-            add(q, OPENAI)
 
-    queries = [v["display"] for v in merged.values()]
+def _openai_layer(seed, country, depth):
+    """ChatGPT fan-out. Depth scales how many queries we ask for in the single
+    call, rather than literal layers (its deeper layers would be invented on invented)."""
+    seen, ordered = set(), []
+    n = config.OPENAI_FANOUT_PER_DEPTH * max(1, depth)
+    for q in openai_fanout(seed, country, n=n):
+        nq = _normalise(q)
+        if nq and nq.lower() not in seen:
+            seen.add(nq.lower())
+            ordered.append(nq)
+    return ordered
+
+
+def generate_fanout(seed, country, providers, depth=None, max_workers=None):
+    """Run the selected engines to `depth`, interleave them so neither dominates
+    the later cap, and merge.
+
+    Returns (queries, source_map, engine_counts). source_map maps a lowercased
+    query to the sorted engines that produced it (so 'Both' shows overlap).
+    """
+    providers = providers or [GEMINI]
+    depth = depth or config.FANOUT_DEPTH_DEFAULT
+    max_workers = max_workers or config.MAX_WORKERS
+
+    gem = _gemini_layers(seed, country, depth, max_workers) if GEMINI in providers else []
+    oai = _openai_layer(seed, country, depth) if OPENAI in providers else []
+    engine_counts = {GEMINI: len(gem), OPENAI: len(oai)}
+
+    merged, order = {}, []
+
+    def add(q, src):
+        key = q.lower()
+        if key not in merged:
+            merged[key] = {"display": q, "sources": set()}
+            order.append(key)
+        merged[key]["sources"].add(src)
+
+    # Interleave the two engines so the later cap takes an even mix.
+    i = j = 0
+    while i < len(gem) or j < len(oai):
+        if i < len(gem):
+            add(gem[i], GEMINI)
+            i += 1
+        if j < len(oai):
+            add(oai[j], OPENAI)
+            j += 1
+
+    queries = [merged[k]["display"] for k in order]
     source_map = {k: sorted(v["sources"]) for k, v in merged.items()}
-    return queries, source_map
+    return queries, source_map, engine_counts

@@ -83,9 +83,9 @@ def _provider_list(engine_choice):
 
 
 def _settings_row(prefix):
-    """Render per-tab country / max queries / engine controls. Returns
-    (country, max_queries, providers)."""
-    c1, c2, c3 = st.columns([1.2, 1, 1.4])
+    """Render per-tab country / max queries / depth / engine controls. Returns
+    (country, max_queries, providers, depth)."""
+    c1, c2, c3, c4 = st.columns([1.2, 0.9, 0.9, 1.7])
     with c1:
         country = st.selectbox(
             "Target country:", config.COUNTRIES, index=0, key=f"{prefix}_country",
@@ -97,19 +97,28 @@ def _settings_row(prefix):
             help="Upper limit on fan-out queries (after dedupe) per URL or topic.",
         )
     with c3:
+        depth = st.slider(
+            "Fan-out depth:", min_value=1, max_value=config.FANOUT_DEPTH_MAX,
+            value=config.FANOUT_DEPTH_DEFAULT, step=1, key=f"{prefix}_depth",
+            help="How many layers deep to fan out. 1 is direct queries only; each extra layer "
+                 "expands the one before it. Deeper is broader but slower and uses more API calls, "
+                 "and it pairs best with a higher max-queries cap.",
+        )
+    with c4:
         engine = st.radio(
             "Fan-out engine:",
             ["Gemini (grounded search)", "ChatGPT", "Both (combine)"],
             index=0, horizontal=True, key=f"{prefix}_engine",
-            help="Gemini uses live Google Search grounding, which mirrors AI Mode. ChatGPT uses "
-                 "its own web search or generation. Both runs each and merges the queries.",
+            help="Gemini uses live Google Search grounding, which mirrors AI Mode. ChatGPT generates "
+                 "its queries. Both runs each and merges them.",
         )
-    return country, max_queries, _provider_list(engine)
+    return country, max_queries, _provider_list(engine), depth
 
 
-def _fanout_reps(seed, providers, country, max_queries):
-    """Generate, dedupe and cap fan-out queries. Returns (raw, reps, groups, source_map)."""
-    queries, source_map = fanout.generate_fanout(seed, country, providers)
+def _fanout_reps(seed, providers, country, max_queries, depth):
+    """Generate, dedupe and cap fan-out queries. Returns
+    (raw, reps, groups, source_map, engine_counts)."""
+    queries, source_map, engine_counts = fanout.generate_fanout(seed, country, providers, depth=depth)
     raw = queries[:]
     if config.ENABLE_DEDUPE and queries:
         reps, groups = text_utils.dedupe_pipeline(
@@ -123,7 +132,7 @@ def _fanout_reps(seed, providers, country, max_queries):
                 seen.add(q.lower())
                 reps.append(q)
                 groups[q] = [q]
-    return raw, reps[:max_queries], groups, source_map
+    return raw, reps[:max_queries], groups, source_map, engine_counts
 
 
 def _sources_for(rep, groups, source_map):
@@ -142,7 +151,7 @@ tab_audit, tab_keyword = st.tabs(["Page gap analysis", "Topic fan-out"])
 # =========================
 
 with tab_audit:
-    country, max_queries, providers = _settings_row("audit")
+    country, max_queries, providers, depth = _settings_row("audit")
 
     st.markdown(
         """
@@ -234,7 +243,7 @@ with tab_audit:
 
     init_audit_state()
 
-    current_inputs = (tuple(urls), target_keyword.strip(), country, max_queries, tuple(providers), mode)
+    current_inputs = (tuple(urls), target_keyword.strip(), country, max_queries, tuple(providers), mode, depth)
     if st.session_state.last_inputs != current_inputs:
         st.session_state.last_inputs = current_inputs
         st.session_state.processed = False
@@ -261,7 +270,7 @@ with tab_audit:
                 continue
 
             seed = target_keyword.strip() or page.h1
-            raw_queries, used_queries, _groups, _src = _fanout_reps(seed, providers, country, max_queries)
+            raw_queries, used_queries, _groups, _src, eng_counts = _fanout_reps(seed, providers, country, max_queries, depth)
             if not used_queries:
                 st.warning(f"Skipped {url}: no fan-out queries generated")
                 st.session_state.skipped.append({"Address": url, "Reason": "No queries generated"})
@@ -281,7 +290,9 @@ with tab_audit:
                 counts[r["status"]] = counts.get(r["status"], 0) + 1
 
             st.session_state.summary.append({
-                "Address": url, "Words": page.word_count, "Fan-out (raw)": len(raw_queries),
+                "Address": url, "Words": page.word_count,
+                "Gemini (raw)": eng_counts.get(fanout.GEMINI, 0),
+                "ChatGPT (raw)": eng_counts.get(fanout.OPENAI, 0),
                 "Queries used": len(used_queries), "Entities": len(rows),
                 "Strong": counts["Strong"], "Thin": counts["Thin"], "Missing": counts["Missing"],
                 "Entity coverage (%)": entity_mod.entity_coverage_percent(rows),
@@ -389,7 +400,7 @@ with tab_audit:
 # =========================
 
 with tab_keyword:
-    kw_country, kw_max, kw_providers = _settings_row("kw")
+    kw_country, kw_max, kw_providers, kw_depth = _settings_row("kw")
 
     st.markdown(
         "Enter a topic, such as solar panels, and this pulls in the relevant fan-out queries from "
@@ -405,6 +416,8 @@ with tab_keyword:
 
     if "phrase_rows" not in st.session_state:
         st.session_state.phrase_rows = []
+    if "phrase_engine_totals" not in st.session_state:
+        st.session_state.phrase_engine_totals = {}
 
     if st.button("Generate topic fan-out", key="run_phrases_btn"):
         phrases = [p.strip() for p in phrases_input.splitlines() if p.strip()]
@@ -412,12 +425,15 @@ with tab_keyword:
             st.warning("Please enter at least one topic.")
         else:
             st.session_state.phrase_rows = []
+            totals = {fanout.GEMINI: 0, fanout.OPENAI: 0}
             progress = st.progress(0)
             status = st.empty()
             for i, phrase in enumerate(phrases, start=1):
                 status.text(f"Processing {i}/{len(phrases)}: {phrase}")
                 try:
-                    _raw, reps, groups, source_map = _fanout_reps(phrase, kw_providers, kw_country, kw_max)
+                    _raw, reps, groups, source_map, eng_counts = _fanout_reps(phrase, kw_providers, kw_country, kw_max, kw_depth)
+                    for _k in totals:
+                        totals[_k] += eng_counts.get(_k, 0)
                     if not reps:
                         st.warning(f"No queries generated for '{phrase}'.")
                         continue
@@ -434,10 +450,17 @@ with tab_keyword:
                 except Exception as e:
                     st.warning(f"Failed to fan out '{phrase}': {e}")
                 progress.progress(i / len(phrases))
+            st.session_state.phrase_engine_totals = totals
             status.text("Done.")
 
     if st.session_state.phrase_rows:
         st.subheader("Topic fan-out grouped by entity")
+        _tot = st.session_state.get("phrase_engine_totals", {})
+        if _tot:
+            st.caption(
+                f"Generated before dedupe and cap: Gemini {_tot.get(fanout.GEMINI, 0)}, "
+                f"ChatGPT {_tot.get(fanout.OPENAI, 0)}."
+            )
         df_kw = pd.DataFrame(st.session_state.phrase_rows).sort_values(
             ["Topic", "Entity"]
         ).reset_index(drop=True)

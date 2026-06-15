@@ -145,8 +145,11 @@ LVL1_TIMEOUT = 30
 LVL2_CANDIDATES = 4
 LVL2_TIMEOUT = 15
 MAX_WORKERS = 6
-OPENAI_FANOUT_N = 15       # queries requested in a single ChatGPT fan-out call
+OPENAI_FANOUT_N = 15       # default ChatGPT queries when depth is not given
 OPENAI_FANOUT_TEMP = 0.5
+OPENAI_FANOUT_PER_DEPTH = 10   # ChatGPT queries requested per depth level (10/20/30)
+FANOUT_DEPTH_DEFAULT = 2       # matches the previous two-level behaviour
+FANOUT_DEPTH_MAX = 3
 
 # Coverage scoring
 GPT_TEMP = 0.1
