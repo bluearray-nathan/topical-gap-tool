@@ -380,6 +380,22 @@ with tab_audit:
                 st.caption("Where the gaps are: missing or thin entities by type")
                 st.altair_chart(type_chart, use_container_width=True)
 
+        if st.session_state.entity_maps:
+            st.subheader("Fan-out queries by entity")
+            st.caption("Every fan-out query and the entity it was grouped into, with that entity's status.")
+            query_rows = []
+            for blk in st.session_state.entity_maps:
+                for r in blk["rows"]:
+                    for q in r["queries"]:
+                        query_rows.append({
+                            "Address": blk["url"], "Entity": r["entity"], "Type": r["type"],
+                            "Status": r["status"], "Fan-out query": q,
+                        })
+            df_queries = _safe(pd.DataFrame(query_rows))
+            st.dataframe(_style_status(df_queries, ["Status"]), use_container_width=True)
+            st.download_button("Download fan-out queries CSV", _csv_bytes(df_queries),
+                               "fanout_queries.csv", "text/csv")
+
         if st.session_state.actions:
             st.subheader("Actions")
             df_actions = _safe(pd.DataFrame(st.session_state.actions))
