@@ -10,6 +10,7 @@ import pandas as pd
 import streamlit as st
 
 import branding
+import charts
 import competitors
 import config
 import coverage
@@ -332,6 +333,22 @@ with tab_audit:
             st.dataframe(df_summary, use_container_width=True)
             st.download_button("Download summary CSV", _csv_bytes(df_summary), "summary.csv", "text/csv")
 
+            rows = st.session_state.summary
+            cov_chart = charts.coverage_bar(rows)
+            if cov_chart is not None:
+                st.caption("Entity coverage by page")
+                st.altair_chart(cov_chart, use_container_width=True)
+            donut = charts.status_donut(
+                sum(int(r.get("Strong", 0)) for r in rows),
+                sum(int(r.get("Thin", 0)) for r in rows),
+                sum(int(r.get("Missing", 0)) for r in rows),
+            )
+            if donut is not None:
+                st.caption("Entity status mix across all pages")
+                _, mid, _ = st.columns([1, 2, 1])
+                with mid:
+                    st.altair_chart(donut, use_container_width=True)
+
         if st.session_state.entity_maps:
             st.subheader("Entity coverage map")
             st.caption("Sorted with missing and thin entities first. These are your content gaps.")
@@ -357,6 +374,12 @@ with tab_audit:
             df_entities = _safe(pd.DataFrame(combined))
             st.download_button("Download entity coverage CSV", _csv_bytes(df_entities), "entity_coverage.csv", "text/csv")
 
+            all_rows = [r for blk in st.session_state.entity_maps for r in blk["rows"]]
+            type_chart = charts.gaps_by_type(all_rows)
+            if type_chart is not None:
+                st.caption("Where the gaps are: missing or thin entities by type")
+                st.altair_chart(type_chart, use_container_width=True)
+
         if st.session_state.actions:
             st.subheader("Actions")
             df_actions = _safe(pd.DataFrame(st.session_state.actions))
@@ -378,6 +401,12 @@ with tab_audit:
                     st.markdown(f"**Entity coverage: {competitors.domain_of(st.session_state.primary_url)} vs competitors**")
                     st.dataframe(_style_status(_safe(df_matrix), comp_cols), use_container_width=True)
                     st.download_button("Download competitor matrix CSV", _csv_bytes(_safe(df_matrix)), "competitor_matrix.csv", "text/csv")
+                    comp_chart = charts.competitor_status_bars(
+                        primary_block["rows"], results, competitors.domain_of, st.session_state.primary_url
+                    )
+                    if comp_chart is not None:
+                        st.caption("Entity coverage by site")
+                        st.altair_chart(comp_chart, use_container_width=True)
                 advantage = competitors.competitor_advantage(primary_block["rows"], results)
                 if advantage:
                     st.markdown("**Where competitors cover an entity and your page does not**")
