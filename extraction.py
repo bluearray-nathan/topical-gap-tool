@@ -9,6 +9,7 @@ import json
 import re
 from dataclasses import dataclass, field
 
+import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 
@@ -300,13 +301,70 @@ def parse_html(url, html) -> PageContent:
     )
 
 
+def fetch_via_dataforseo(url, timeout=60):
+    """Fetch a page's raw HTML through DataForSEO's On-Page API, for pages the direct
+    crawler cannot read (e.g. Cloudflare). Returns HTML or None.
+
+    Two calls: instant_pages (JS rendering + store_raw_html) fetches and stores the page,
+    then raw_html retrieves the stored markup. Authenticated with the DataForSEO login
+    and password from secrets.
+    """
+    login = config.get_dataforseo_login()
+    password = config.get_dataforseo_password()
+    if not (login and password):
+        return None
+    auth = (login, password)
+    try:
+        r1 = requests.post(
+            "https://api.dataforseo.com/v3/on_page/instant_pages",
+            auth=auth, timeout=timeout,
+            json=[{"url": url, "enable_javascript": True, "store_raw_html": True,
+                   "custom_user_agent": config.get_user_agent()}],
+        )
+        r1.raise_for_status()
+        task = (r1.json().get("tasks") or [{}])[0]
+        task_id = task.get("id")
+        if not task_id:
+            st.warning(f"DataForSEO fetch failed for {url}: {task.get('status_message', 'no task id')}")
+            return None
+
+        r2 = requests.post(
+            "https://api.dataforseo.com/v3/on_page/raw_html",
+            auth=auth, timeout=timeout,
+            json=[{"id": task_id, "url": url}],
+        )
+        r2.raise_for_status()
+        result = ((r2.json().get("tasks") or [{}])[0].get("result") or [{}])[0] or {}
+        items = result.get("items")
+        if isinstance(items, list):
+            return (items[0] or {}).get("html") if items else None
+        if isinstance(items, dict):
+            return items.get("html")
+        return None
+    except Exception as e:
+        st.warning(f"DataForSEO fetch failed for {url}: {e}")
+        return None
+
+
 def extract_page(url, need_h1=True) -> PageContent:
-    """Fetch and parse a URL into structured, boilerplate-free content."""
+    """Fetch and parse a URL into structured, boilerplate-free content.
+
+    Falls back to DataForSEO (when configured) if the direct fetch is blocked or
+    unreadable, so anti-bot-protected pages can still be analysed.
+    """
     try:
         html = fetch_html(url, need_h1=need_h1)
+        page = parse_html(url, html)
     except Exception as e:
-        return PageContent(url=url, error=_friendly_fetch_error(e))
-    return parse_html(url, html)
+        page = PageContent(url=url, error=_friendly_fetch_error(e))
+
+    if not page.ok and config.dataforseo_available():
+        df_html = fetch_via_dataforseo(url)
+        if df_html:
+            df_page = parse_html(url, df_html)
+            if df_page.ok:
+                return df_page
+    return page
 
 
 @st.cache_data(show_spinner=False, ttl=3600)

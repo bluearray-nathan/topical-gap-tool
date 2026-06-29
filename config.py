@@ -44,6 +44,19 @@ def get_serpapi_key():
     return _secret_value(("serpapi", "api_key")) or os.getenv("SERPAPI_API_KEY")
 
 
+def get_dataforseo_login():
+    return _secret_value(("dataforseo", "login")) or os.getenv("DATAFORSEO_LOGIN")
+
+
+def get_dataforseo_password():
+    return _secret_value(("dataforseo", "password")) or os.getenv("DATAFORSEO_PASSWORD")
+
+
+def dataforseo_available():
+    """Optional fetch fallback for pages the direct crawler cannot read (e.g. Cloudflare)."""
+    return bool(get_dataforseo_login() and get_dataforseo_password())
+
+
 # =========================
 # MODEL NAMES (override-able)
 # =========================
