@@ -270,7 +270,13 @@ with tab_audit:
                 progress.progress(int(((idx + 1) / total) * 100))
                 continue
 
-            seed = target_keyword.strip() or page.h1
+            seed = target_keyword.strip() or page.h1 or page.title
+            if not seed.strip():
+                reason = "No H1 or title to seed the analysis (page may be blocked or JavaScript-rendered)"
+                st.warning(f"Skipped {url}: {reason}")
+                st.session_state.skipped.append({"Address": url, "Reason": reason})
+                progress.progress(int(((idx + 1) / total) * 100))
+                continue
             raw_queries, used_queries, _groups, _src, eng_counts = _fanout_reps(seed, providers, country, max_queries, depth)
             if not used_queries:
                 st.warning(f"Skipped {url}: no fan-out queries generated")

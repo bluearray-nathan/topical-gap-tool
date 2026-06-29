@@ -33,6 +33,7 @@ _STRUCTURAL_SCHEMA = {
 class PageContent:
     url: str
     h1: str = ""
+    title: str = ""                                      # <title>, used as a seed fallback
     headings: list = field(default_factory=list)        # list[(level, text)]
     body: str = ""                                       # clean main-content text, uncapped
     faqs: list = field(default_factory=list)             # list[str] of questions
@@ -214,15 +215,50 @@ def _collect_faqs(struct_soup, headings, schema_questions):
     return ded
 
 
+MIN_CONTENT_WORDS = 50
+
+# Markers that the response is an anti-bot challenge or interstitial rather than the
+# real page (Cloudflare and similar). When present, the content is not usable, and
+# auditing it would fan out from a meaningless seed.
+_BLOCK_MARKERS = (
+    "just a moment...",
+    "attention required! | cloudflare",
+    "cf-browser-verification",
+    "cf_chl_opt",
+    "challenge-platform",
+    "checking your browser before accessing",
+    "enable javascript and cookies to continue",
+    "ddos protection by cloudflare",
+    "please turn javascript on and reload the page",
+)
+
+
+def _looks_blocked(html) -> bool:
+    head = html[:8000].lower()
+    return any(m in head for m in _BLOCK_MARKERS)
+
+
 def parse_html(url, html) -> PageContent:
     """Parse fetched HTML into structured, boilerplate-free content.
 
-    Separated from fetching so it can be tested without network access.
+    Separated from fetching so it can be tested without network access. Sets an error
+    (so the caller skips the page) when the response is an anti-bot challenge or has too
+    little real content to analyse, rather than letting the audit fan out from nothing.
     """
     if not html:
         return PageContent(url=url, error="Empty response from page")
 
     soup = BeautifulSoup(html, "html.parser")
+    title_tag = soup.find("title")
+    title = title_tag.get_text(strip=True) if title_tag else ""
+
+    if _looks_blocked(html):
+        return PageContent(
+            url=url, title=title,
+            error="Blocked by anti-bot protection (likely Cloudflare). Could not read the page "
+                  "content. This site needs a proxy or a working browser fetch.",
+        )
+
     schema_nodes = _parse_jsonld(soup)
     declared_entities, schema_questions = _split_schema(schema_nodes)
 
@@ -243,15 +279,24 @@ def parse_html(url, html) -> PageContent:
 
     body = _extract_body(html, url, struct)
     faqs = _collect_faqs(struct, headings, schema_questions)
+    word_count = len(body.split())
+
+    if word_count < MIN_CONTENT_WORDS and not h1:
+        return PageContent(
+            url=url, title=title, h1=h1, headings=headings, body=body, word_count=word_count,
+            error="Could not read enough page content to analyse. The page may be "
+                  "JavaScript-rendered or blocked by anti-bot protection.",
+        )
 
     return PageContent(
         url=url,
         h1=h1,
+        title=title,
         headings=headings,
         body=body,
         faqs=faqs,
         jsonld_entities=declared_entities,
-        word_count=len(body.split()),
+        word_count=word_count,
     )
 
 

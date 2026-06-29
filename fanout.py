@@ -291,6 +291,10 @@ def generate_fanout(seed, country, providers, depth=None, max_workers=None):
     depth = depth or config.FANOUT_DEPTH_DEFAULT
     max_workers = max_workers or config.MAX_WORKERS
 
+    # Never fan out from an empty seed; that produces unrelated noise.
+    if not (seed or "").strip():
+        return [], {}, {GEMINI: 0, OPENAI: 0}
+
     gem = _gemini_layers(seed, country, depth, max_workers) if GEMINI in providers else []
     oai = _openai_layer(seed, country, depth) if OPENAI in providers else []
     engine_counts = {GEMINI: len(gem), OPENAI: len(oai)}
